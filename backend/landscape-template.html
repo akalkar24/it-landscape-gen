@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{DOMAIN_NAME}} — Technology Landscape</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=Syne:wght@400;500;600;700;800&family=JetBrains+Mono:wght@300;400;500;700&display=swap');
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#060A12;--surface:#0C1220;--s2:#111827;--s3:#1A2338;
+  --border:rgba(255,255,255,0.07);--border2:rgba(255,255,255,0.12);
+  --text:#E2E8FF;--muted:#5A6A88;--muted2:#8899BB;
+  --blue:#3B82F6;--purple:#7C3AED;--teal:#0D9488;
+  --amber:#D97706;--red:#DC2626;--cyan:#0891B2;
+  --green:#059669;--slate:#475569;--violet:#6D28D9;
+  --fd:'DM Serif Display',serif;--fs:'Syne',sans-serif;--fm:'JetBrains Mono',monospace
+}
+body{background:var(--bg);color:var(--text);font-family:var(--fs);overflow-x:hidden}
+::-webkit-scrollbar{width:4px;height:4px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--s3);border-radius:2px}
+@keyframes fadeUp{from{opacity:0;transform:translateY(24px)}to{opacity:1;transform:translateY(0)}}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+@keyframes glow{0%,100%{box-shadow:0 0 20px rgba(59,130,246,0.15)}50%{box-shadow:0 0 40px rgba(59,130,246,0.3)}}
+
+/* NAV */
+.nav{position:fixed;top:0;left:0;right:0;height:54px;background:rgba(6,10,18,0.92);backdrop-filter:blur(24px);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 40px;z-index:100}
+.nav-brand{display:flex;align-items:center;gap:12px}
+.nav-logo{width:30px;height:30px;border-radius:7px;background:linear-gradient(135deg,var(--blue),var(--purple));display:flex;align-items:center;justify-content:center;font-family:var(--fm);font-size:10px;font-weight:700;color:#fff;letter-spacing:1px}
+.nav-title{font-family:var(--fd);font-size:15px;color:var(--text)}
+.nav-tabs{display:flex;gap:2px}
+.nav-tab{padding:7px 18px;border-radius:7px;border:none;cursor:pointer;font-family:var(--fm);font-size:11px;transition:all 0.15s;background:transparent;color:var(--muted);letter-spacing:.5px}
+.nav-tab.active{background:rgba(59,130,246,0.12);color:#93C5FD}
+.nav-tab:hover:not(.active){color:var(--text);background:rgba(255,255,255,0.04)}
+.nav-badge{font-family:var(--fm);font-size:9px;color:var(--amber);background:rgba(217,119,6,0.1);border:1px solid rgba(217,119,6,0.2);padding:3px 10px;border-radius:4px;letter-spacing:2px}
+
+/* SECTIONS */
+.section{display:none;padding:78px 0 60px;min-height:100vh;animation:fadeIn 0.3s ease}
+.section.active{display:block}
+.container{max-width:1400px;margin:0 auto;padding:0 40px}
+
+/* OVERVIEW */
+.ov-hero{padding:60px 40px 40px;max-width:1400px;margin:0 auto}
+.ov-eyebrow{display:flex;align-items:center;gap:10px;margin-bottom:20px}
+.ov-line{width:40px;height:1px;background:var(--blue)}
+.ov-tag{font-family:var(--fm);font-size:9px;color:var(--blue);letter-spacing:4px;text-transform:uppercase}
+.ov-h1{font-family:var(--fd);font-size:clamp(40px,5vw,72px);line-height:1.05;margin-bottom:16px}
+.ov-h1 em{font-style:italic;color:#93C5FD}
+.ov-sub{font-size:16px;color:var(--muted2);line-height:1.7;max-width:620px;margin-bottom:48px}
+.ov-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:1px;background:var(--border);border:1px solid var(--border);border-radius:12px;overflow:hidden;margin-bottom:48px}
+.ov-stat{padding:24px;background:var(--surface)}
+.ov-stat-val{font-family:var(--fm);font-size:32px;font-weight:700;line-height:1}
+.ov-stat-lbl{font-size:11px;color:var(--muted);margin-top:6px}
+.ov-chain{margin-bottom:0}
+.ov-chain-title{font-family:var(--fm);font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--muted);margin-bottom:14px}
+.ov-chain-strip{display:flex;gap:8px;overflow-x:auto;padding-bottom:4px}
+.ov-chain-pill{flex-shrink:0;padding:10px 16px;border-radius:8px;border:1px solid var(--border);cursor:pointer;transition:all 0.15s}
+.ov-chain-pill:hover{transform:translateY(-2px)}
+.ov-chain-pill-phase{font-family:var(--fm);font-size:8px;letter-spacing:3px;opacity:.8;margin-bottom:4px}
+.ov-chain-pill-name{font-size:11.5px;font-weight:600}
+
+/* CATEGORIES */
+.cat-header{padding:40px 40px 32px;max-width:1400px;margin:0 auto}
+.page-title{font-family:var(--fd);font-size:40px;margin-bottom:8px}
+.page-sub{color:var(--muted2);font-size:14px}
+.cat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:16px;padding:0 40px;max-width:1400px;margin:0 auto}
+.cat-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;cursor:pointer;transition:all 0.2s;position:relative}
+.cat-card:hover{border-color:var(--border2);transform:translateY(-2px)}
+.cat-card-bar{height:3px}
+.cat-card-body{padding:22px 24px}
+.cat-phase{font-family:var(--fm);font-size:8px;letter-spacing:4px;text-transform:uppercase;margin-bottom:8px}
+.cat-name{font-family:var(--fd);font-size:19px;margin-bottom:8px;line-height:1.2}
+.cat-meta{display:flex;gap:16px;align-items:center;margin-bottom:12px}
+.cat-market{font-family:var(--fm);font-size:16px;font-weight:700}
+.cat-cagr{font-family:var(--fm);font-size:12px;padding:2px 8px;border-radius:4px}
+.cat-desc{font-size:13px;color:var(--muted2);line-height:1.65;margin-bottom:14px}
+.cat-caps{display:flex;flex-wrap:wrap;gap:5px}
+.cat-cap-pill{font-size:10px;color:rgba(255,255,255,0.4);background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.07);padding:3px 9px;border-radius:4px}
+.cat-vendor-count{position:absolute;top:18px;right:18px;font-family:var(--fm);font-size:10px;color:var(--muted);background:var(--s2);padding:3px 10px;border-radius:5px}
+
+/* VENDORS */
+.vendor-controls{padding:32px 40px 20px;max-width:1400px;margin:0 auto;display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+.search-wrap{position:relative;flex:1;min-width:200px;max-width:320px}
+.search-input{width:100%;padding:9px 14px 9px 36px;background:var(--surface);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:var(--fs);font-size:13px;outline:none}
+.search-input:focus{border-color:rgba(59,130,246,0.3)}
+.search-icon{position:absolute;left:11px;top:50%;transform:translateY(-50%);color:var(--muted);font-size:13px}
+.filter-group{display:flex;gap:6px;flex-wrap:wrap}
+.filter-chip{padding:7px 14px;border-radius:7px;border:1px solid var(--border);cursor:pointer;font-family:var(--fm);font-size:10px;color:var(--muted);background:transparent;transition:all 0.15s;letter-spacing:.5px}
+.filter-chip.on{color:var(--text);border-color:rgba(255,255,255,0.2);background:rgba(255,255,255,0.06)}
+.filter-chip.active-type-ai.on{color:#FCD34D;border-color:rgba(245,158,11,0.35);background:rgba(245,158,11,0.08)}
+.filter-chip.active-type-legacy.on{color:#93C5FD;border-color:rgba(59,130,246,0.35);background:rgba(59,130,246,0.08)}
+
+.vendor-list{max-width:1400px;margin:0 auto;padding:0 40px}
+.vendor-count{font-family:var(--fm);font-size:11px;color:var(--muted);margin-bottom:16px}
+
+/* Vendor row */
+.vr{border-bottom:1px solid rgba(255,255,255,0.05);cursor:pointer;transition:background 0.12s}
+.vr:hover .vr-main{background:rgba(255,255,255,0.02)}
+.vr-main{display:flex;align-items:center;gap:16px;padding:14px 18px;border-radius:8px;transition:background 0.12s}
+.vr-idx{font-family:var(--fm);font-size:10px;color:var(--muted);width:28px;flex-shrink:0}
+.vr-name{font-weight:700;font-size:14px;flex:1;min-width:120px}
+.vr-badges{display:flex;gap:6px;flex-shrink:0}
+.badge{display:inline-block;padding:2px 8px;border-radius:3px;font-family:var(--fm);font-size:8px;font-weight:700;letter-spacing:.5px}
+.badge-ai{background:rgba(245,158,11,0.1);color:#FCD34D;border:1px solid rgba(245,158,11,0.2)}
+.badge-legacy{background:rgba(59,130,246,0.1);color:#93C5FD;border:1px solid rgba(59,130,246,0.2)}
+.badge-analyst{background:rgba(139,92,246,0.1);color:#C4B5FD;border:1px solid rgba(139,92,246,0.2)}
+.badge-agentic{background:rgba(16,185,129,0.08);color:#6EE7B7;border:1px solid rgba(16,185,129,0.2)}
+.vr-cat{font-family:var(--fm);font-size:9px;letter-spacing:2px;padding:3px 8px;border-radius:4px;flex-shrink:0}
+.vr-fin{display:flex;gap:20px;flex-shrink:0}
+.vr-fin-item{text-align:right}
+.vr-fin-val{font-family:var(--fm);font-size:12px;font-weight:700}
+.vr-fin-lbl{font-family:var(--fm);font-size:9px;color:var(--muted)}
+.vr-hq{font-size:12px;color:var(--muted);flex-shrink:0;width:140px;text-align:right}
+.vr-chevron{color:var(--muted);font-size:12px;transition:transform 0.2s;flex-shrink:0}
+
+/* Vendor drawer */
+.vr-drawer{display:none;padding:0 18px 18px;background:var(--s2);border-top:1px solid var(--border);animation:fadeIn 0.2s ease}
+.vr-drawer.open{display:block}
+.vd-grid{display:grid;grid-template-columns:2fr 1fr 1fr;gap:20px;padding-top:18px}
+.vd-section-title{font-family:var(--fm);font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--muted);margin-bottom:10px;border-bottom:1px solid var(--border);padding-bottom:6px}
+.vd-row{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.04)}
+.vd-row:last-child{border:none}
+.vd-key{font-size:11px;color:var(--muted)}
+.vd-val{font-family:var(--fm);font-size:11px;text-align:right}
+.vd-desc{font-size:13px;color:var(--muted2);line-height:1.65;margin-bottom:14px}
+.vd-products{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px}
+.vd-product{font-size:11px;padding:3px 10px;border-radius:4px;border:1px solid var(--border);color:var(--muted2)}
+.vd-caps{display:flex;flex-direction:column;gap:4px}
+.vd-cap-row{display:flex;align-items:center;gap:10px}
+.vd-cap-name{font-size:11px;color:var(--muted2);min-width:160px}
+.vd-cap-bar-wrap{flex:1;height:4px;background:rgba(255,255,255,0.06);border-radius:2px;overflow:hidden}
+.vd-cap-bar{height:100%;border-radius:2px;transition:width 0.6s ease}
+.vd-cap-val{font-family:var(--fm);font-size:10px;width:30px;text-align:right}
+
+/* HEATMAP */
+.hm-controls{padding:32px 40px 16px;max-width:1400px;margin:0 auto;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.hm-wrap{overflow-x:auto;padding:0 40px;max-width:1400px;margin:0 auto}
+table.hm{border-collapse:collapse;min-width:max-content;border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.hm th{background:var(--s2);border-bottom:1px solid var(--border);padding:8px 4px;text-align:center}
+.hm .cap-th{min-width:200px;text-align:left;padding:8px 14px;position:sticky;left:0;z-index:2;background:var(--s2)}
+.hm .v-th{width:44px;vertical-align:bottom;padding-bottom:10px}
+.hm .v-name{writing-mode:vertical-rl;transform:rotate(180deg);font-family:var(--fm);font-size:8px;white-space:nowrap;padding:0 2px}
+.hm tr:nth-child(even) td{background:rgba(255,255,255,0.01)}
+.hm tr.cat-row td{background:rgba(255,255,255,0.02);padding:7px 14px}
+.hm .cap-td{position:sticky;left:0;background:var(--surface);border-right:1px solid var(--border);z-index:1;font-size:11.5px;color:rgba(255,255,255,0.55);padding:6px 14px;white-space:nowrap}
+.hm tr:nth-child(even) .cap-td{background:rgba(255,255,255,0.015)}
+.score-cell{width:38px;height:22px;border-radius:3px;display:flex;align-items:center;justify-content:center;margin:2px auto;font-family:var(--fm);font-size:8px;font-weight:700;cursor:default;transition:transform 0.1s}
+.score-cell:hover{transform:scale(1.3)}
+</style>
+</head>
+<body>
+
+<!-- NAV -->
+<nav class="nav">
+  <div class="nav-brand">
+    <div class="nav-logo">{{DOMAIN_ABBR}}</div>
+    <div class="nav-title">{{DOMAIN_NAME}}</div>
+  </div>
+  <div class="nav-tabs">
+    <button class="nav-tab active" onclick="showSection('overview')">Overview</button>
+    <button class="nav-tab" onclick="showSection('categories')">Categories</button>
+    <button class="nav-tab" onclick="showSection('vendors')">Vendors</button>
+    <button class="nav-tab" onclick="showSection('heatmap')">Capability Matrix</button>
+  </div>
+  <span class="nav-badge">{{GENERATED_DATE}}</span>
+</nav>
+
+<!-- OVERVIEW -->
+<div id="s-overview" class="section active">
+  <div class="ov-hero">
+    <div class="ov-eyebrow"><div class="ov-line"></div><span class="ov-tag">CIO Intelligence Series</span></div>
+    <h1 class="ov-h1">{{DOMAIN_NAME}}<br><em>Vendor Landscape</em></h1>
+    <p class="ov-sub" id="ov-sub">A comprehensive market intelligence report covering the full {{DOMAIN_NAME}} value chain.</p>
+    <div class="ov-stats" id="ov-stats"></div>
+    <div class="ov-chain">
+      <div class="ov-chain-title">Value Chain</div>
+      <div class="ov-chain-strip" id="ov-chain"></div>
+    </div>
+  </div>
+</div>
+
+<!-- CATEGORIES -->
+<div id="s-categories" class="section">
+  <div class="cat-header">
+    <h2 class="page-title">Category Taxonomy</h2>
+    <p class="page-sub">The value chain organises vendors by the problems they solve, left to right.</p>
+  </div>
+  <div class="cat-grid" id="cat-grid"></div>
+</div>
+
+<!-- VENDORS -->
+<div id="s-vendors" class="section">
+  <div class="vendor-controls">
+    <div class="search-wrap">
+      <span class="search-icon">⌕</span>
+      <input class="search-input" id="v-search" placeholder="Search vendors..." oninput="filterVendors()">
+    </div>
+    <div class="filter-group" id="type-filters">
+      <button class="filter-chip on" id="ft-all" onclick="setTypeFilter('all')">All Types</button>
+      <button class="filter-chip active-type-ai" id="ft-AI-Native" onclick="setTypeFilter('AI-Native')">AI-Native</button>
+      <button class="filter-chip active-type-legacy" id="ft-Legacy" onclick="setTypeFilter('Legacy')">Legacy</button>
+      <button class="filter-chip" id="ft-Analyst" onclick="setTypeFilter('Analyst')">Analyst</button>
+    </div>
+    <div class="filter-group" id="cat-filters"></div>
+  </div>
+  <div class="vendor-list">
+    <div class="vendor-count" id="vendor-count"></div>
+    <div id="vendor-rows"></div>
+  </div>
+</div>
+
+<!-- HEATMAP -->
+<div id="s-heatmap" class="section">
+  <div class="hm-controls">
+    <span style="font-family:var(--fm);font-size:10px;color:var(--muted);letter-spacing:2px;text-transform:uppercase;margin-right:8px">Filter:</span>
+    <button class="filter-chip on" id="hf-all" onclick="setHmFilter(null)">All Categories</button>
+    <div id="hm-cat-filters"></div>
+  </div>
+  <div class="hm-wrap"><table class="hm" id="hm-table"></table></div>
+</div>
+
+<script>
+// ── DATA (injected by pipeline) ──────────────────────────────────────────────
+const DATA = {{LANDSCAPE_JSON}};
+const { categories, vendors, capabilities } = DATA;
+
+// ── STATE ─────────────────────────────────────────────────────────────────────
+let typeFilter = 'all', catFilter = null, hmCatFilter = null;
+
+// ── NAV ───────────────────────────────────────────────────────────────────────
+function showSection(id) {
+  document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+  document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('s-' + id).classList.add('active');
+  event.target.classList.add('active');
+}
+
+// ── HELPERS ───────────────────────────────────────────────────────────────────
+const getCat = id => categories.find(c => c.id === id) || {};
+const fmt = v => v != null ? `$${Number(v).toLocaleString()}M` : '—';
+const badgeClass = t => t==='AI-Native'?'badge-ai':t==='Analyst'?'badge-analyst':'badge-legacy';
+
+const SCORE_BG = s => {
+  if (!s) return 'rgba(255,255,255,0.04)';
+  if (s>=90) return '#14532D'; if (s>=75) return '#166534';
+  if (s>=60) return '#15803D'; if (s>=45) return '#854D0E';
+  if (s>=30) return '#7C2D12'; return '#450A0A';
+};
+const SCORE_TC = s => s>=45 ? '#fff' : 'rgba(255,255,255,0.35)';
+
+// ── OVERVIEW ──────────────────────────────────────────────────────────────────
+function renderOverview() {
+  const aiN = vendors.filter(v=>v.type==='AI-Native').length;
+  const tot = categories.reduce((s,c)=>s+parseFloat((c.market||'$0').replace(/[^0-9.]/g,'')||0), 0);
+
+  document.getElementById('ov-stats').innerHTML = [
+    {l:'Total Vendors',v:vendors.length,c:DATA.meta?.domain_name?'#3B82F6':'#3B82F6'},
+    {l:'Market Categories',v:categories.length,c:'#8B5CF6'},
+    {l:'AI-Native Vendors',v:aiN,c:'#D97706'},
+    {l:'Combined TAM',v:`$${tot.toFixed(1)}B`,c:'#0D9488'},
+    {l:'Capabilities Tracked',v:capabilities.length,c:'#0891B2'},
+  ].map(s=>`<div class="ov-stat"><div class="ov-stat-val" style="color:${s.c}">${s.v}</div><div class="ov-stat-lbl">${s.l}</div></div>`).join('');
+
+  document.getElementById('ov-chain').innerHTML = categories.map(c=>`
+    <div class="ov-chain-pill" style="background:${c.dim||'rgba(59,130,246,0.08)'};border-color:${c.color}30" onclick="showSection('categories')">
+      <div class="ov-chain-pill-phase" style="color:${c.color}">${c.phase}</div>
+      <div class="ov-chain-pill-name" style="color:${c.color}">${c.short||c.name}</div>
+    </div>`).join('');
+}
+
+// ── CATEGORIES ────────────────────────────────────────────────────────────────
+function renderCategories() {
+  const vendorsByCat = {};
+  vendors.forEach(v => { vendorsByCat[v.cat] = (vendorsByCat[v.cat]||0)+1; });
+
+  document.getElementById('cat-grid').innerHTML = categories.map(c=>`
+    <div class="cat-card" onclick="jumpToCategory(${c.id})">
+      <div class="cat-card-bar" style="background:${c.color}"></div>
+      <div class="cat-vendor-count">${vendorsByCat[c.id]||0} vendors</div>
+      <div class="cat-card-body">
+        <div class="cat-phase" style="color:${c.color}">${c.phase}</div>
+        <div class="cat-name">${c.name}</div>
+        <div class="cat-meta">
+          <span class="cat-market" style="color:${c.color}">${c.market}</span>
+          <span class="cat-cagr" style="color:${c.color};background:${c.dim||'rgba(59,130,246,0.08)'}">${c.cagr} CAGR</span>
+        </div>
+        <div class="cat-desc">${c.desc}</div>
+        <div class="cat-caps">${(c.capabilities_preview||[]).map(p=>`<span class="cat-cap-pill">${p}</span>`).join('')}</div>
+        <div style="margin-top:10px;font-size:10px;color:var(--muted);font-family:var(--fm)">${c.gartner||''}</div>
+      </div>
+    </div>`).join('');
+}
+
+function jumpToCategory(catId) {
+  catFilter = catId;
+  document.querySelectorAll('.nav-tab')[2].click();
+  document.querySelectorAll('.nav-tab').forEach((t,i)=>{if(i===2)t.classList.add('active')});
+  document.querySelectorAll('.section').forEach(s=>s.classList.remove('active'));
+  document.getElementById('s-vendors').classList.add('active');
+  document.querySelectorAll('.nav-tab').forEach(t=>t.classList.remove('active'));
+  document.querySelectorAll('.nav-tab')[2].classList.add('active');
+  renderCatFilters();
+  filterVendors();
+}
+
+// ── VENDORS ───────────────────────────────────────────────────────────────────
+function renderCatFilters() {
+  const el = document.getElementById('cat-filters');
+  el.innerHTML = `<button class="filter-chip${catFilter===null?' on':''}" onclick="setCatFilter(null)">All Categories</button>` +
+    categories.map(c=>`<button class="filter-chip${catFilter===c.id?' on':''}" style="${catFilter===c.id?`color:${c.color};border-color:${c.color}50;background:${c.dim}`:''}" onclick="setCatFilter(${c.id})">${c.phase}</button>`).join('');
+}
+
+function setTypeFilter(t) {
+  typeFilter = t;
+  document.querySelectorAll('[id^="ft-"]').forEach(b => b.classList.toggle('on', b.id === 'ft-'+t));
+  filterVendors();
+}
+
+function setCatFilter(id) {
+  catFilter = id;
+  renderCatFilters();
+  filterVendors();
+}
+
+function filterVendors() {
+  const q = (document.getElementById('v-search').value||'').toLowerCase();
+  const filtered = vendors.filter(v => {
+    if (typeFilter !== 'all' && v.type !== typeFilter) return false;
+    if (catFilter !== null && v.cat !== catFilter) return false;
+    if (q) {
+      const haystack = `${v.name} ${v.desc||''} ${v.products||''} ${v.capabilities||''}`.toLowerCase();
+      if (!haystack.includes(q)) return false;
+    }
+    return true;
+  });
+  document.getElementById('vendor-count').textContent = `${filtered.length} of ${vendors.length} vendors`;
+  renderVendorRows(filtered);
+}
+
+function renderVendorRows(list) {
+  document.getElementById('vendor-rows').innerHTML = list.map((v,i) => {
+    const cat = getCat(v.cat);
+    return `<div class="vr" id="vr-${v.id}">
+      <div class="vr-main" onclick="toggleDrawer(${v.id})">
+        <span class="vr-idx">${String(i+1).padStart(2,'0')}</span>
+        <span class="vr-name">${v.name}</span>
+        <div class="vr-badges">
+          <span class="badge ${badgeClass(v.type)}">${v.type}</span>
+          ${v.agentic?'<span class="badge badge-agentic">AGENTIC</span>':''}
+        </div>
+        <span class="vr-cat" style="color:${cat.color||'var(--muted)'};background:${cat.dim||'rgba(255,255,255,0.04)'}">${cat.phase||''}</span>
+        <div class="vr-fin">
+          <div class="vr-fin-item"><div class="vr-fin-val" style="color:var(--text)">${v.founded||'—'}</div><div class="vr-fin-lbl">Founded</div></div>
+          <div class="vr-fin-item"><div class="vr-fin-val" style="color:${v.funding?'#FCD34D':'var(--muted)'}">${fmt(v.funding)}</div><div class="vr-fin-lbl">Funding</div></div>
+          <div class="vr-fin-item"><div class="vr-fin-val" style="color:${v.arr?'#6EE7B7':'var(--muted)'}">${fmt(v.arr)}</div><div class="vr-fin-lbl">ARR</div></div>
+        </div>
+        <span class="vr-hq">${v.hq||''}</span>
+        <span class="vr-chevron" id="chev-${v.id}">▾</span>
+      </div>
+      <div class="vr-drawer" id="vd-${v.id}">
+        ${renderDrawer(v, cat)}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function renderDrawer(v, cat) {
+  // Get capability scores for this vendor
+  const vCaps = capabilities.filter(c => c.cat === v.cat);
+  const capHTML = vCaps.length ? `
+    <div class="vd-section-title">Capability Scores — ${cat.name||''}</div>
+    <div class="vd-caps">
+      ${vCaps.map(c => {
+        const s = (c.scores||{})[v.name] || 0;
+        const bg = SCORE_BG(s);
+        return `<div class="vd-cap-row">
+          <div class="vd-cap-name">${c.name}</div>
+          <div class="vd-cap-bar-wrap"><div class="vd-cap-bar" style="width:${s}%;background:${bg}"></div></div>
+          <div class="vd-cap-val" style="color:${SCORE_TC(s)}">${s||'—'}</div>
+        </div>`;
+      }).join('')}
+    </div>` : '';
+
+  return `<div class="vd-grid">
+    <div>
+      <div class="vd-section-title">About</div>
+      <div class="vd-desc">${v.desc||'—'}</div>
+      ${v.products?`<div class="vd-section-title">Core Products</div><div class="vd-products">${v.products.split(/[,;]/).map(p=>`<span class="vd-product">${p.trim()}</span>`).join('')}</div>`:''}
+      ${capHTML}
+    </div>
+    <div>
+      <div class="vd-section-title">Company Profile</div>
+      ${[['Status',v.status],['Founded',v.founded],['HQ',v.hq],['Employees',v.employees?Number(v.employees).toLocaleString():null],['Ticker',v.ticker]].filter(r=>r[1]).map(([k,val])=>`<div class="vd-row"><span class="vd-key">${k}</span><span class="vd-val">${val}</span></div>`).join('')}
+    </div>
+    <div>
+      <div class="vd-section-title">Financials</div>
+      ${[['Funding',fmt(v.funding)],['Valuation',fmt(v.valuation)],['ARR/Rev',fmt(v.arr)],['Last Round',v.round_type||null],['Round Amt',v.round_amount?fmt(v.round_amount):null],['Round Date',v.round_date||null],['Acquirer',v.acquirer||null],['Acq Price',v.acq_price?fmt(v.acq_price):null],['Investors',v.investors||null]].filter(r=>r[1]&&r[1]!=='—').map(([k,val])=>`<div class="vd-row"><span class="vd-key">${k}</span><span class="vd-val" style="max-width:140px;text-align:right;word-break:break-word">${val}</span></div>`).join('')}
+    </div>
+  </div>`;
+}
+
+const openDrawers = new Set();
+function toggleDrawer(id) {
+  const drawer = document.getElementById('vd-'+id);
+  const chev = document.getElementById('chev-'+id);
+  if (!drawer) return;
+  const isOpen = openDrawers.has(id);
+  if (isOpen) { drawer.classList.remove('open'); chev.style.transform=''; openDrawers.delete(id); }
+  else { drawer.classList.add('open'); chev.style.transform='rotate(180deg)'; openDrawers.add(id); }
+}
+
+// ── HEATMAP ───────────────────────────────────────────────────────────────────
+function renderHmCatFilters() {
+  document.getElementById('hm-cat-filters').innerHTML = categories.map(c=>`
+    <button class="filter-chip${hmCatFilter===c.id?' on':''}" style="${hmCatFilter===c.id?`color:${c.color};border-color:${c.color}50;background:${c.dim}`:''}" onclick="setHmFilter(${c.id})">${c.phase} — ${c.short||c.name}</button>`).join('');
+}
+
+function setHmFilter(id) {
+  hmCatFilter = id;
+  document.getElementById('hf-all').classList.toggle('on', id===null);
+  renderHmCatFilters();
+  renderHeatmap();
+}
+
+function renderHeatmap() {
+  const filteredCaps = hmCatFilter ? capabilities.filter(c=>c.cat===hmCatFilter) : capabilities;
+  const displayVendors = vendors.slice(0,24);
+
+  let html = `<thead><tr>
+    <th class="cap-th">CAPABILITY</th>
+    ${displayVendors.map(v=>`<th class="v-th"><div class="v-name" style="color:${v.type==='AI-Native'?'#FCD34D':v.type==='Analyst'?'#C4B5FD':'#93C5FD'}">${v.name}</div></th>`).join('')}
+  </tr></thead><tbody>`;
+
+  const catGroups = {};
+  filteredCaps.forEach(c=>{ if(!catGroups[c.cat]) catGroups[c.cat]=[]; catGroups[c.cat].push(c); });
+
+  Object.entries(catGroups).forEach(([catId,caps])=>{
+    const cat = getCat(parseInt(catId));
+    html += `<tr class="cat-row"><td colspan="${displayVendors.length+1}" style="color:${cat.color};font-family:var(--fm);font-size:9px;letter-spacing:3px;text-transform:uppercase">${cat.phase} — ${cat.name}</td></tr>`;
+    caps.forEach(cap=>{
+      html += `<tr><td class="cap-td" title="${cap.definition||''}">${cap.name}</td>
+        ${displayVendors.map(v=>{
+          const s=(cap.scores||{})[v.name]||0;
+          return `<td style="padding:3px;text-align:center"><div class="score-cell" style="background:${SCORE_BG(s)}" title="${v.name}: ${s||'N/A'}"><span style="color:${SCORE_TC(s)}">${s||'—'}</span></div></td>`;
+        }).join('')}
+      </tr>`;
+    });
+  });
+  html += '</tbody>';
+  document.getElementById('hm-table').innerHTML = html;
+}
+
+// ── INIT ──────────────────────────────────────────────────────────────────────
+renderOverview();
+renderCategories();
+renderCatFilters();
+filterVendors();
+renderHmCatFilters();
+renderHeatmap();
+</script>
+</body>
+</html>
