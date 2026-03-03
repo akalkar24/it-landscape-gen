@@ -401,12 +401,13 @@ export default function App() {
         es.close();
         return;
       }
-      if (entry.msg === '__ERROR__') {
-        es.close();
-        setError('Pipeline failed — check the log above for details');
-        setView('home');
-        return;
-      }
+        if (entry.msg === '__ERROR__') {
+  es.close();
+  // Stay on running view so the user can actually read the log
+  setError('Pipeline failed — see log above for the specific error');
+  return;
+}
+     
       if (entry.msg === '__CANCELLED__') {
         // cancelJob() already handles view transition, just close the stream
         es.close();
@@ -646,6 +647,12 @@ export default function App() {
         </button>
       </div>
     </div>
+    {error && (
+  <div style={{marginBottom:12,padding:'11px 15px',background:'rgba(239,68,68,0.08)',border:'1px solid rgba(239,68,68,0.25)',borderRadius:8,color:'#FCA5A5',fontSize:13,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+    <span>✗ {error}</span>
+    <button onClick={()=>{setView('home');setError(null);}} style={{background:'transparent',border:'1px solid rgba(239,68,68,0.3)',color:'#FCA5A5',borderRadius:5,padding:'3px 10px',cursor:'pointer',fontFamily:'var(--fm)',fontSize:11}}>← New Run</button>
+  </div>
+    )}
     <div ref={logsRef} style={{background:'var(--surface)',border:'1px solid var(--border)',borderRadius:10,padding:'18px 22px',height:440,overflowY:'auto',fontFamily:'var(--fm)',fontSize:11.5,lineHeight:1.9}}>
       {logs.length===0 && <span style={{color:'var(--muted)',animation:'pulse 1.5s ease infinite'}}>Connecting to pipeline...</span>}
       {logs.map((e,i)=>(
