@@ -342,7 +342,7 @@ async function buildPipeline(jobId, domain, brief, persona, apiKey) {
     L(`  [${cat.phase}] Discovering vendors...`);
     return withRetry(async () => {
       const r = await client.messages.create({
-        model: MODEL, max_tokens:4000,
+        model: MODEL, max_tokens:6000,
         system:`You are a senior technology analyst. Profile 8-12 vendors for this market category from your training knowledge. For public companies include known revenue/ARR. For private companies use last known funding round. Set unknown financials to null — null is better than a wrong number. Legacy=founded pre-2016 or traditional SaaS; AI-Native=LLM/ML-first product, founded post-2018 with AI core; Analyst=research/advisory firm. Output ONLY valid JSON.`,
         messages:[{role:'user',content:`Domain: ${domain}\nCategory: ${cat.name} [${cat.phase} phase]\nDescription: ${cat.desc}\nKey capabilities: ${(cat.capabilities_preview||[]).join(', ')}\nBuyer: ${persona}\n\nFind 8-12 vendors. Balance ~50% Legacy, ~45% AI-Native, ~5% Analyst.\n\n${vSchema}`}]
       });
@@ -380,7 +380,7 @@ async function buildPipeline(jobId, domain, brief, persona, apiKey) {
   const verifySchema = `{"new_vendors":[{"name":"str","type":"AI-Native|Legacy","status":"Private|Public","hq":"City, Country","founded":2020,"funding":30,"valuation":null,"round_type":"Series A|null","round_amount":30,"round_date":"Jan 2025|null","acq_price":null,"acquirer":null,"employees":80,"arr":null,"investors":"VC Names","agentic":true,"cat":1,"desc":"2 sentences.","products":"Product A, B","capabilities":"Cap 1; Cap 2"}]}`;
 
   const catBatchesV = [];
-  for(let i=0; i<categories.length; i+=3) catBatchesV.push(categories.slice(i,i+3));
+  for(let i=0; i<categories.length; i+=1) catBatchesV.push(categories.slice(i,i+1));
   const verifiedNewVendors = [];
   const existingNames = new Set(vendors.map(v => v.name.toLowerCase()));
 
@@ -419,8 +419,8 @@ ${verifySchema}`}]
       if (e.message === '__CANCELLED__') throw e;
       L(`  ✗ Verify batch ${bi+1} failed: ${e.message}`, 'error');
     }
-    // 20s between verification batches — web search is heavy on TPM (load-bearing)
-    if(bi < catBatchesV.length - 1) await sleep(20000);
+    // 30s between verification batches — web search is heavy on TPM (load-bearing)
+    if(bi < catBatchesV.length - 1) await sleep(30000);
   }
 
   if(verifiedNewVendors.length > 0) {
