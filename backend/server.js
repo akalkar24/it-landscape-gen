@@ -2,11 +2,19 @@
  * Landscape Generator Backend
  * Express + SSE for long-running agent jobs
  * Deploy to Railway — no timeout limits
+ *
+ * FIXES (March 2026):
+ *  1. Model updated: claude-sonnet-4-20250514 → claude-sonnet-4-6
+ *  2. Web search calls now use wsClient with anthropic-beta header (required for web_search tool)
+ *  3. Cancellation guards (checkCancelled) added throughout both pipelines
+ *  4. Cancel endpoint now sends __CANCELLED__ signal (not __ERROR__) so frontend can distinguish
+ *  5. Library delete route fixed — was broken with dynamic import(fs), now uses top-level unlinkSync
+ *  6. All rate-limit sleep delays preserved — they are load-bearing, do not remove
  */
 import express from 'express';
 import cors from 'cors';
 import { randomUUID } from 'crypto';
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync, unlinkSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import Anthropic from '@anthropic-ai/sdk';
@@ -14,9 +22,7 @@ import Anthropic from '@anthropic-ai/sdk';
 const __dir = dirname(fileURLToPath(import.meta.url));
 const TEMPLATE = readFileSync(join(__dir, 'landscape-template.html'), 'utf8');
 
-// ── LANDSCAPE LIBRARY (persistent to /data or ./library) ─────────────────────
-// Railway: attach a Volume mounted at /data for persistence across deploys
-// Local dev: falls back to ./library folder
+// ── LANDSCAPE LIBRARY ─────────────────────────────────────────────────────────
 const LIBRARY_DIR = existsSync('/data') ? '/data/landscapes' : join(__dir, 'library');
 if (!existsSync(LIBRARY_DIR)) mkdirSync(LIBRARY_DIR, { recursive: true });
 
@@ -46,7 +52,6 @@ function libraryGet(id) {
   if (!existsSync(fp)) return null;
   return JSON.parse(readFileSync(fp, 'utf8'));
 }
-
 
 const app = express();
 app.use(cors());
@@ -96,9 +101,13 @@ app.post('/api/job/:id/cancel', (req, res) => {
   job.cancelled = true;
   job.status = 'cancelled';
   log(req.params.id, 'Run cancelled by user', 'error');
-  (sseListeners.get(req.params.id)||[]).forEach(r => { try { r.write('data: ' + JSON.stringify({msg:'__ERROR__',level:'system'}) + '\n\n'); r.end(); } catch {} });
+  // FIX: __CANCELLED__ so frontend can distinguish from a real pipeline error
+  (sseListeners.get(req.params.id)||[]).forEach(r => {
+    try { r.write('data: ' + JSON.stringify({msg:'__CANCELLED__',level:'system'}) + '\n\n'); r.end(); } catch {}
+  });
   res.json({ ok:true });
 });
+
 // ── LIBRARY ROUTES ────────────────────────────────────────────────────────────
 app.get('/api/library', (_, res) => res.json(libraryList()));
 
@@ -116,14 +125,14 @@ app.post('/api/library', (req, res) => {
   res.json({ id });
 });
 
+// FIX: was using dynamic import('fs').then(({unlinkSync})=>unlinkSync(fp)) which is buggy
+// Now uses top-level unlinkSync imported at the top
 app.delete('/api/library/:id', (req, res) => {
   const fp = join(LIBRARY_DIR, `${req.params.id}.json`);
   if (!existsSync(fp)) return res.status(404).json({ error:'Not found' });
-  try { import('fs').then(({unlinkSync})=>unlinkSync(fp)); res.json({ ok:true }); }
+  try { unlinkSync(fp); res.json({ ok:true }); }
   catch(e) { res.status(500).json({ error:e.message }); }
 });
-
-
 
 app.post('/api/generate', (req, res) => {
   const { domain, brief, persona='CIO', apiKey } = req.body;
@@ -132,7 +141,9 @@ app.post('/api/generate', (req, res) => {
   if (!key) return res.status(400).json({ error:'Anthropic API key required' });
   const jobId = createJob(domain, 'build');
   res.json({ jobId });
-  buildPipeline(jobId, domain, brief, persona, key).catch(e => fail(jobId, e.message));
+  buildPipeline(jobId, domain, brief, persona, key).catch(e => {
+    if (e.message !== '__CANCELLED__') fail(jobId, e.message);
+  });
 });
 
 app.post('/api/refresh', (req, res) => {
@@ -142,7 +153,9 @@ app.post('/api/refresh', (req, res) => {
   if (!key) return res.status(400).json({ error:'Anthropic API key required' });
   const jobId = createJob(domain, 'refresh');
   res.json({ jobId });
-  refreshPipeline(jobId, domain, existingData, brief, persona, key).catch(e => fail(jobId, e.message));
+  refreshPipeline(jobId, domain, existingData, brief, persona, key).catch(e => {
+    if (e.message !== '__CANCELLED__') fail(jobId, e.message);
+  });
 });
 
 app.get('/api/job/:id', (req, res) => {
@@ -152,7 +165,12 @@ app.get('/api/job/:id', (req, res) => {
   res.setHeader('Cache-Control','no-cache');
   res.setHeader('Connection','keep-alive');
   job.logs.forEach(e => res.write(`data: ${JSON.stringify(e)}\n\n`));
-  if (job.status !== 'running') { res.write(`data: ${JSON.stringify({msg:'__DONE__',level:'system'})}\n\n`); return res.end(); }
+  if (job.status !== 'running') {
+    // FIX: replay the right terminal signal when reconnecting to a finished/cancelled job
+    const sig = job.status === 'cancelled' ? '__CANCELLED__' : '__DONE__';
+    res.write(`data: ${JSON.stringify({msg:sig,level:'system'})}\n\n`);
+    return res.end();
+  }
   if (!sseListeners.has(req.params.id)) sseListeners.set(req.params.id, []);
   sseListeners.get(req.params.id).push(res);
   req.on('close', () => { const l=sseListeners.get(req.params.id)||[]; const i=l.indexOf(res); if(i>=0) l.splice(i,1); });
@@ -169,7 +187,6 @@ app.post('/api/job/:id/approve', (req, res) => {
   if (!job || job.status !== 'review') return res.status(400).json({ error:'Job not in review state' });
   if (req.body.result) job.result = req.body.result;
   job.status = 'approved';
-  // Auto-save to library on approve
   try {
     const { categories, vendors, capabilities } = job.result;
     const libId = librarySave(job.domain, { categories, vendors, capabilities });
@@ -183,10 +200,8 @@ app.post('/api/job/:id/deploy', async (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error:'Not found' });
   if (!['approved','review'].includes(job.status)) return res.status(400).json({ error:'Approve the job first' });
-
   const vercelToken = req.body.vercelToken || process.env.VERCEL_TOKEN;
   if (!vercelToken) return res.status(400).json({ error:'Vercel token required. Add to .env or provide in request.' });
-
   try {
     const url = await deployToVercel(job.result, job.domain, vercelToken);
     job.status = 'deployed'; job.deployUrl = url;
@@ -200,17 +215,12 @@ async function deployToVercel(landscapeData, domain, token) {
   const slug = domain.toLowerCase().replace(/[^a-z0-9]/g,'-').replace(/-+/g,'-');
   const abbr = domain.split(' ').map(w=>w[0]).join('').toUpperCase().slice(0,3);
   const date = new Date().toLocaleDateString('en-US',{month:'short',year:'numeric'});
-
-  // Inject data into template
   const html = TEMPLATE
     .replace(/\{\{DOMAIN_NAME\}\}/g, domain)
     .replace(/\{\{DOMAIN_ABBR\}\}/g, abbr)
     .replace(/\{\{GENERATED_DATE\}\}/g, date)
     .replace('{{LANDSCAPE_JSON}}', JSON.stringify(landscapeData));
-
   const htmlB64 = Buffer.from(html, 'utf8').toString('base64');
-
-  // POST to Vercel Deploy API
   const deployResp = await fetch('https://api.vercel.com/v13/deployments', {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -221,11 +231,8 @@ async function deployToVercel(landscapeData, domain, token) {
       projectSettings: { framework: null, buildCommand: null, outputDirectory: null, installCommand: null, devCommand: null }
     })
   });
-
   const deployData = await deployResp.json();
   if (!deployResp.ok) throw new Error(deployData.error?.message || JSON.stringify(deployData));
-
-  // Poll until ready (max 90s)
   const deployId = deployData.id;
   for (let i = 0; i < 30; i++) {
     await new Promise(r => setTimeout(r, 3000));
@@ -250,6 +257,8 @@ function parseJSON(text) {
   return JSON.parse(s);
 }
 
+const sleep = ms => new Promise(res => setTimeout(res, ms));
+
 const CAT_COLORS = [
   ['#3B82F6','rgba(59,130,246,0.1)'],['#8B5CF6','rgba(139,92,246,0.1)'],
   ['#0D9488','rgba(13,148,136,0.1)'],['#D97706','rgba(217,119,6,0.1)'],
@@ -265,10 +274,8 @@ function validateResult(result) {
   if (categories.length < 7) issues.push(`Only ${categories.length} categories (min 7)`);
   if (vendors.length < 40) issues.push(`Only ${vendors.length} vendors (min 40)`);
   if (capabilities.length < 20) issues.push(`Only ${capabilities.length} capabilities (min 20)`);
-  // Check for vendors with no category
   const orphans = vendors.filter(v => !categories.find(c => c.id === v.cat));
   if (orphans.length) issues.push(`${orphans.length} vendors with invalid category ID`);
-  // Check score ranges
   let badScores = 0;
   capabilities.forEach(cap => Object.values(cap.scores||{}).forEach(s => { if(s<0||s>100) badScores++; }));
   if (badScores) issues.push(`${badScores} capability scores out of 0-100 range`);
@@ -277,14 +284,28 @@ function validateResult(result) {
 
 // ── BUILD PIPELINE ────────────────────────────────────────────────────────────
 async function buildPipeline(jobId, domain, brief, persona, apiKey) {
-  const client = new Anthropic({ apiKey });
+  // FIX 1: Updated model string
+  const MODEL = 'claude-sonnet-4-6';
+
+  // FIX 2: Two clients — standard for non-search calls, wsClient for web_search tool calls
+  // The web_search tool requires the 'anthropic-beta: web-search-2025-03-05' header
+  const client   = new Anthropic({ apiKey });
+  const wsClient = new Anthropic({ apiKey, defaultHeaders: { 'anthropic-beta': 'web-search-2025-03-05' } });
+
   const L = (m,lv='info') => log(jobId,m,lv);
+
+  // FIX 3: Cancellation guard — throws so all awaits unwind immediately when user hits Stop
+  const checkCancelled = () => {
+    if (jobs.get(jobId)?.cancelled) throw new Error('__CANCELLED__');
+  };
+
   L(`New landscape: ${domain} | Persona: ${persona}`);
 
-  // 1a — Categories
+  // ── Stage 1a: Category Agent ──────────────────────────────────────────────
+  checkCancelled();
   L(''); L('── Stage 1a: Category Agent ──────────────────', 'stage');
   const catResp = await client.messages.create({
-    model:'claude-sonnet-4-20250514', max_tokens:3000,
+    model: MODEL, max_tokens:3000,
     system:`You are a senior technology analyst. Build a MECE value-chain taxonomy of 8-10 categories for the given technology domain from your training knowledge. Categories flow left to right: discovery/awareness → execution → optimization/renewal. Market sizes from Gartner/IDC/MarketsandMarkets. Phase labels are short ALL CAPS verbs (DISCOVER, MAP, GOVERN, OPTIMIZE, RENEW etc). Output ONLY valid JSON, no preamble.`,
     messages:[{role:'user',content:`Domain: ${domain}\nPersona: ${persona}\nBrief:\n${brief}\n\nOutput: {"categories":[{"id":1,"phase":"VERB","name":"Full Name","short":"Short (2-3 words)","market":"$XB","cagr":"X%","desc":"2-3 sentence description of what this category does and why it matters to the buyer.","capabilities_preview":["5 specific capability names"],"gartner":"Official Gartner segment name"}]}`}]
   });
@@ -292,18 +313,19 @@ async function buildPipeline(jobId, domain, brief, persona, apiKey) {
   const categories = catData.categories.map((c,i) => ({...c, id:i+1, color:CAT_COLORS[i%10][0], dim:CAT_COLORS[i%10][1]}));
   L(`✓ ${categories.length} categories`, 'success');
 
-  // 1b — Vendors (sequential with retry)
-  L(''); L(`── Stage 1b: Vendor Agent (sequential, no web search) ──`, 'stage');
+  // ── Stage 1b: Vendor Agent (sequential, 5s gap between categories) ────────
+  checkCancelled();
+  L(''); L(`── Stage 1b: Vendor Agent (sequential) ──`, 'stage');
   const vSchema = `{"vendors":[{"name":"str","type":"Legacy|AI-Native|Analyst","status":"Public|Private|Acquired|Division","ticker":"str|null","hq":"City, Country","founded":2015,"funding":150,"valuation":null,"round_type":"Series B|null","round_amount":50,"round_date":"Jan 2024|null","acq_price":null,"acquirer":null,"employees":500,"arr":80,"investors":"VC Names","agentic":true,"desc":"2 clear sentences. What it does and why buyers buy it.","products":"Product A, Product B, Product C","capabilities":"Cap 1; Cap 2; Cap 3; Cap 4"}]}`;
 
-  const sleep = ms => new Promise(res => setTimeout(res, ms));
-
-  // Retry wrapper — handles 429 rate limits with exponential backoff
+  // Retry with exponential backoff — delays are load-bearing for TPM management
   async function withRetry(fn, label, maxRetries = 4) {
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      checkCancelled();
       try {
         return await fn();
       } catch(e) {
+        if (e.message === '__CANCELLED__') throw e;
         const is429 = e.status === 429 || (e.message||'').includes('rate_limit');
         if (is429 && attempt < maxRetries) {
           const wait = Math.pow(2, attempt + 1) * 15000; // 30s, 60s, 120s, 240s
@@ -320,8 +342,8 @@ async function buildPipeline(jobId, domain, brief, persona, apiKey) {
     L(`  [${cat.phase}] Discovering vendors...`);
     return withRetry(async () => {
       const r = await client.messages.create({
-        model:'claude-sonnet-4-20250514', max_tokens:4000,
-        system:`You are a senior technology analyst. Profile 8-12 vendors for this market category from your training knowledge. For public companies include known revenue/ARR. For private companies use last known funding round. Set unknown financials to null - null is better than a wrong number. Legacy=founded pre-2016 or traditional SaaS; AI-Native=LLM/ML-first product, founded post-2018 with AI core; Analyst=research/advisory firm. Output ONLY valid JSON.`,
+        model: MODEL, max_tokens:4000,
+        system:`You are a senior technology analyst. Profile 8-12 vendors for this market category from your training knowledge. For public companies include known revenue/ARR. For private companies use last known funding round. Set unknown financials to null — null is better than a wrong number. Legacy=founded pre-2016 or traditional SaaS; AI-Native=LLM/ML-first product, founded post-2018 with AI core; Analyst=research/advisory firm. Output ONLY valid JSON.`,
         messages:[{role:'user',content:`Domain: ${domain}\nCategory: ${cat.name} [${cat.phase} phase]\nDescription: ${cat.desc}\nKey capabilities: ${(cat.capabilities_preview||[]).join(', ')}\nBuyer: ${persona}\n\nFind 8-12 vendors. Balance ~50% Legacy, ~45% AI-Native, ~5% Analyst.\n\n${vSchema}`}]
       });
       const d = parseJSON(extractText(r));
@@ -331,46 +353,46 @@ async function buildPipeline(jobId, domain, brief, persona, apiKey) {
     }, cat.phase);
   }
 
-  // Run sequentially — one category at a time, 12s gap between each
-  // Sequential to be safe; gaps keep us well under TPM limits
   const vendors = [];
   for (let i = 0; i < categories.length; i++) {
-    if (jobs.get(jobId)?.cancelled) { L('Run cancelled', 'error'); return; }
+    checkCancelled();
     const cat = categories[i];
     try {
       const vends = await fetchVendorsForCat(cat);
       vendors.push(...vends);
     } catch(e) {
+      if (e.message === '__CANCELLED__') throw e;
       L(`  [${cat.phase}] ✗ Failed after retries: ${e.message}`, 'error');
     }
-    // 12s gap between calls — keeps well under 30k TPM
+    // 5s gap between category calls — keeps well under TPM limits (load-bearing, do not remove)
     if (i < categories.length - 1) await sleep(5000);
   }
   vendors.forEach((v,i) => { v.id=i+1; });
   L(`✓ ${vendors.length} total vendors`, 'success');
 
-
-  // 1c — Verification (3 web search calls, one per category batch)
+  // ── Stage 1c: Verification Agent (web search gap-check) ───────────────────
+  checkCancelled();
   L(''); L('── Stage 1c: Verification Agent (web search gap-check) ──', 'stage');
   L(`  Checking for missing vendors — especially recent AI-native startups...`);
-  await sleep(15000); // Let TPM window clear before web search
+  // 15s buffer to let TPM window clear before web search (load-bearing — do not remove)
+  await sleep(15000);
 
   const verifySchema = `{"new_vendors":[{"name":"str","type":"AI-Native|Legacy","status":"Private|Public","hq":"City, Country","founded":2020,"funding":30,"valuation":null,"round_type":"Series A|null","round_amount":30,"round_date":"Jan 2025|null","acq_price":null,"acquirer":null,"employees":80,"arr":null,"investors":"VC Names","agentic":true,"cat":1,"desc":"2 sentences.","products":"Product A, B","capabilities":"Cap 1; Cap 2"}]}`;
 
   const catBatchesV = [];
   for(let i=0; i<categories.length; i+=3) catBatchesV.push(categories.slice(i,i+3));
-
   const verifiedNewVendors = [];
   const existingNames = new Set(vendors.map(v => v.name.toLowerCase()));
 
   for(let bi=0; bi<catBatchesV.length; bi++) {
+    checkCancelled();
     const batch = catBatchesV[bi];
     L(`  Verifying batch ${bi+1}/${catBatchesV.length}: [${batch.map(c=>c.phase).join(', ')}]`);
     const existingInBatch = vendors.filter(v => batch.some(c => c.id === v.cat)).map(v => v.name);
-
     try {
-      const rv = await withRetry(async () => client.messages.create({
-        model:'claude-sonnet-4-20250514', max_tokens:4000,
+      // FIX: use wsClient — web_search tool requires the anthropic-beta header
+      const rv = await withRetry(async () => wsClient.messages.create({
+        model: MODEL, max_tokens:4000,
         system:`You are a technology analyst finding gaps in a vendor landscape. Find notable vendors MISSED in the initial pass — especially recently funded AI-native startups (last 18 months), niche specialists, recently acquired companies. Only return vendors you can verify exist via web search. Output ONLY valid JSON.`,
         tools:[{type:'web_search_20250305',name:'web_search'}],
         messages:[{role:'user',content:`Domain: ${domain}
@@ -394,8 +416,10 @@ ${verifySchema}`}]
       verifiedNewVendors.push(...newOnes);
       L(`  ✓ Batch ${bi+1}: +${newOnes.length} new vendors`, 'success');
     } catch(e) {
+      if (e.message === '__CANCELLED__') throw e;
       L(`  ✗ Verify batch ${bi+1} failed: ${e.message}`, 'error');
     }
+    // 20s between verification batches — web search is heavy on TPM (load-bearing)
     if(bi < catBatchesV.length - 1) await sleep(20000);
   }
 
@@ -408,19 +432,21 @@ ${verifySchema}`}]
     L(`✓ Verification complete — no gaps found`, 'success');
   }
 
-  // 1d — Scoring (batched)
+  // ── Stage 1d: Scoring Agent (batched, 3 categories at a time) ─────────────
+  checkCancelled();
   L(''); L('── Stage 1d: Scoring Agent ───────────────────', 'stage');
   const allVendorNames = [...new Set(vendors.map(v=>v.name))];
   const capabilities = [];
-  const batches = [];
-  for(let i=0; i<categories.length; i+=3) batches.push(categories.slice(i,i+3));
+  const scoreBatches = [];
+  for(let i=0; i<categories.length; i+=3) scoreBatches.push(categories.slice(i,i+3));
 
-  for(const batch of batches) {
+  for(const batch of scoreBatches) {
+    checkCancelled();
     const bIds = batch.map(c=>c.id);
     L(`  Scoring [${bIds.join(',')}]...`);
     const bVendors = vendors.filter(v=>bIds.includes(v.cat));
     const r = await client.messages.create({
-      model:'claude-sonnet-4-20250514', max_tokens:12000,
+      model: MODEL, max_tokens:12000,
       system:`You are a technology analyst scoring vendor capabilities 0-100. Scale: 90-100=Best-in-Class (only 1 per capability), 75-89=Strong, 60-74=Capable, 45-59=Present, 30-44=Limited, 0=Not applicable. Differentiate clearly — avoid clustering scores in the 60-75 band. AI-Native vendors should score higher on AI/automation capabilities. Legacy vendors should score higher on enterprise integrations and compliance. Output ONLY valid JSON.`,
       messages:[{role:'user',content:`Domain: ${domain}
 
@@ -443,7 +469,7 @@ Output: {"capabilities":[{"cat":1,"name":"Specific Capability Name","definition"
   }
   L(`✓ ${capabilities.length} capabilities scored`, 'success');
 
-  // Validation pass
+  // ── Validation ────────────────────────────────────────────────────────────
   L(''); L('── Validation ────────────────────────────────', 'stage');
   const issues = validateResult({ categories, vendors, capabilities });
   if (issues.length) {
@@ -458,15 +484,24 @@ Output: {"capabilities":[{"cat":1,"name":"Specific Capability Name","definition"
 
 // ── REFRESH PIPELINE ──────────────────────────────────────────────────────────
 async function refreshPipeline(jobId, domain, existingData, brief, persona, apiKey) {
-  const client = new Anthropic({ apiKey });
+  const MODEL = 'claude-sonnet-4-6';
+
+  // FIX: two clients — wsClient for web_search calls, client for everything else
+  const client   = new Anthropic({ apiKey });
+  const wsClient = new Anthropic({ apiKey, defaultHeaders: { 'anthropic-beta': 'web-search-2025-03-05' } });
+
   const L = (m,lv='info') => log(jobId,m,lv);
+  const checkCancelled = () => { if (jobs.get(jobId)?.cancelled) throw new Error('__CANCELLED__'); };
+
   const { categories, vendors, capabilities } = existingData;
   L(`Refreshing: ${domain} | ${vendors.length} existing vendors`);
 
   // Step 1 — Staleness check
+  checkCancelled();
   L(''); L('── Step 1: Staleness Check ───────────────────', 'stage');
-  const staleResp = await client.messages.create({
-    model:'claude-sonnet-4-20250514', max_tokens:5000,
+  // FIX: use wsClient for web_search tool
+  const staleResp = await wsClient.messages.create({
+    model: MODEL, max_tokens:5000,
     system:`Check for vendor status changes since mid-2024. Search for acquisitions, IPOs, shutdowns, major funding rounds. Output ONLY valid JSON.`,
     tools:[{type:'web_search_20250305',name:'web_search'}],
     messages:[{role:'user',content:`Check these ${domain} vendors for recent changes:\n${vendors.map(v=>v.name).join(', ')}\n\nOutput: {"changes":[{"name":"VendorName","change_type":"acquired|ipo|shutdown|funding","description":"Brief description of change","new_status":"Public|Private|Acquired","new_funding":150,"acquirer":"Name or null","acq_price":500}]}\n\nOnly include vendors with confirmed, verifiable changes.`}]
@@ -477,10 +512,12 @@ async function refreshPipeline(jobId, domain, existingData, brief, persona, apiK
   L(`✓ ${changes.length} status changes found`, 'success');
 
   // Step 2 — New vendor discovery
+  checkCancelled();
   L(''); L('── Step 2: New Vendor Discovery ─────────────', 'stage');
   const existingNames = new Set(vendors.map(v=>v.name.toLowerCase()));
-  const newVendorResp = await client.messages.create({
-    model:'claude-sonnet-4-20250514', max_tokens:8000,
+  // FIX: use wsClient
+  const newVendorResp = await wsClient.messages.create({
+    model: MODEL, max_tokens:8000,
     system:`Find new AI-native startups and recently-funded vendors not yet in the landscape. Focus on last 12 months. Verify each via web search. Output ONLY valid JSON.`,
     tools:[{type:'web_search_20250305',name:'web_search'}],
     messages:[{role:'user',content:`Domain: ${domain}\nCategories: ${categories.map(c=>c.name).join(', ')}\n${brief?`Context: ${brief.slice(0,300)}`:''}
@@ -499,12 +536,13 @@ Output: {"vendors":[{"name":"str","type":"AI-Native|Legacy","status":"Private","
   newVendors.forEach(v => L(`  + ${v.name} [${v.type}] → Cat ${v.cat}`));
   L(`✓ ${newVendors.length} new vendors found`, 'success');
 
-  // Step 3 — Score new vendors
+  // Step 3 — Score new vendors (only if any were found)
   let updatedCaps = capabilities;
   if (newVendors.length > 0) {
+    checkCancelled();
     L(''); L('── Step 3: Scoring New Vendors ───────────────', 'stage');
     const scoreResp = await client.messages.create({
-      model:'claude-sonnet-4-20250514', max_tokens:6000,
+      model: MODEL, max_tokens:6000,
       system:`Score new vendors 0-100 on existing capability dimensions. Use the same scale: 90+=Best-in-Class, 75-89=Strong, 60-74=Capable, 45-59=Present, 30-44=Limited, 0=N/A. Output ONLY valid JSON.`,
       messages:[{role:'user',content:`New vendors:\n${newVendors.map(v=>`${v.name} [${v.type}] Cat${v.cat}: ${v.desc}`).join('\n')}\n\nExisting capabilities:\n${capabilities.map(c=>`Cat${c.cat} "${c.name}": ${c.definition||''}`).join('\n')}\n\nOutput: {"scores":[{"vendor":"Name","capability":"Exact cap name","score":75}]}`}]
     });
@@ -519,7 +557,7 @@ Output: {"vendors":[{"name":"str","type":"AI-Native|Legacy","status":"Private","
     } catch(e) { L(`  Warning: score parse: ${e.message}`, 'error'); }
   }
 
-  // Apply staleness updates
+  // Apply staleness updates to existing vendors
   const updatedVendors = vendors.map(v => {
     const c = changes.find(ch=>ch.name.toLowerCase()===v.name.toLowerCase());
     if (!c) return v;
@@ -529,7 +567,7 @@ Output: {"vendors":[{"name":"str","type":"AI-Native|Legacy","status":"Private","
   newVendors.forEach((v,i) => { v.id=maxId+i+1; });
   const allVendors = [...updatedVendors, ...newVendors];
 
-  L(`\n  ${vendors.length} → ${allVendors.length} vendors | +${newVendors.length} added | ${changes.length} updated`, 'success');
+  L(`  ${vendors.length} → ${allVendors.length} vendors | +${newVendors.length} added | ${changes.length} updated`, 'success');
 
   finalize(jobId, {
     categories, vendors:allVendors, capabilities:updatedCaps,
