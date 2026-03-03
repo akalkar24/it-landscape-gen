@@ -403,6 +403,12 @@ export default function App() {
     return () => clearInterval(t);
   }, [view, startedAt]);
 
+  async function cancelJob() {
+    if (!jobId) return;
+    try { await fetch(`${API}/api/job/${jobId}/cancel`, { method:'POST' }); } catch {}
+    setView('home'); setJobId(null); setLogs([]); setStartedAt(null); setElapsed(0);
+  }
+
   async function approve() {
     await fetch(`${API}/api/job/${jobId}/approve`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({result}) });
     setJobStatus('approved');
@@ -610,6 +616,11 @@ export default function App() {
               <h2 style={{fontFamily:'var(--fd)',fontSize:28}}>{mode==='build'?'Building':'Refreshing'}: {form.domain}</h2>
               <div style={{marginLeft:'auto',fontFamily:'var(--fm)',fontSize:12,color:'var(--muted)',background:'var(--surface)',border:'1px solid var(--border)',borderRadius:7,padding:'5px 14px',whiteSpace:'nowrap'}}>
                 ⏱ {Math.floor(elapsed/60)}m {String(elapsed%60).padStart(2,'0')}s
+              </div>
+              <button onClick={cancelJob} style={{marginLeft:8,padding:'5px 14px',background:'rgba(239,68,68,0.1)',border:'1px solid rgba(239,68,68,0.3)',borderRadius:7,color:'#FCA5A5',cursor:'pointer',fontFamily:'var(--fm)',fontSize:11,fontWeight:600}}>
+                ✕ Cancel Run
+              </button>
+              <div style={{display:'none'}}>
               </div>
             </div>
             <div ref={logsRef} style={{background:'var(--surface)',border:'1px solid var(--border)',borderRadius:10,padding:'18px 22px',height:440,overflowY:'auto',fontFamily:'var(--fm)',fontSize:11.5,lineHeight:1.9}}>
