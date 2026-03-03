@@ -228,6 +228,8 @@ export default function App() {
   const [logs, setLogs] = useState([]);
   const [result, setResult] = useState(null);
   const [jobStatus, setJobStatus] = useState(null);
+  const [startedAt, setStartedAt] = useState(null);
+  const [elapsed, setElapsed] = useState(0);
   const [error, setError] = useState(null);
   const [existingJson, setExistingJson] = useState("");
   const [refreshTab, setRefreshTab] = useState("library"); // library | upload | paste
@@ -383,7 +385,7 @@ export default function App() {
       const resp = await fetch(`${API}${endpoint}`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
       const d = await resp.json();
       if (!resp.ok) { setError(d.error); return; }
-      setJobId(d.jobId); setView('running');
+      setJobId(d.jobId); setStartedAt(Date.now()); setElapsed(0); setView('running');
       const es = new EventSource(`${API}/api/job/${d.jobId}`);
       es.onmessage = e => {
         const entry = JSON.parse(e.data);
@@ -393,6 +395,13 @@ export default function App() {
       es.onerror = () => es.close();
     } catch(e) { setError(e.message); }
   }
+
+  // Elapsed timer — ticks every second while running
+  useEffect(() => {
+    if (view !== 'running' || !startedAt) return;
+    const t = setInterval(() => setElapsed(Math.floor((Date.now()-startedAt)/1000)), 1000);
+    return () => clearInterval(t);
+  }, [view, startedAt]);
 
   async function approve() {
     await fetch(`${API}/api/job/${jobId}/approve`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({result}) });
@@ -599,11 +608,14 @@ export default function App() {
             <div style={{display:'flex',alignItems:'center',gap:14,marginBottom:24}}>
               <div style={{width:18,height:18,border:'2px solid var(--blue)',borderTopColor:'transparent',borderRadius:'50%',animation:'spin 0.8s linear infinite',flexShrink:0}}/>
               <h2 style={{fontFamily:'var(--fd)',fontSize:28}}>{mode==='build'?'Building':'Refreshing'}: {form.domain}</h2>
+              <div style={{marginLeft:'auto',fontFamily:'var(--fm)',fontSize:12,color:'var(--muted)',background:'var(--surface)',border:'1px solid var(--border)',borderRadius:7,padding:'5px 14px',whiteSpace:'nowrap'}}>
+                ⏱ {Math.floor(elapsed/60)}m {String(elapsed%60).padStart(2,'0')}s
+              </div>
             </div>
             <div ref={logsRef} style={{background:'var(--surface)',border:'1px solid var(--border)',borderRadius:10,padding:'18px 22px',height:440,overflowY:'auto',fontFamily:'var(--fm)',fontSize:11.5,lineHeight:1.9}}>
               {logs.length===0 && <span style={{color:'var(--muted)',animation:'pulse 1.5s ease infinite'}}>Connecting to pipeline...</span>}
               {logs.map((e,i)=>(
-                <div key={i} style={{color:LC(e.level),paddingLeft:e.level==='stage'?0:14}}>{e.msg}</div>
+                <div key={i} style={{color:LC(e.level),paddingLeft:e.level==='stage'?0:14,display:'flex',gap:10}}><span style={{color:'rgba(255,255,255,0.18)',flexShrink:0,userSelect:'none'}}>{e.t?new Date(e.t).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'}):''}</span><span>{e.msg}</span></div>
               ))}
             </div>
             <p style={{marginTop:14,fontSize:11,color:'var(--muted)',textAlign:'center'}}>Running in the cloud — this tab can stay open or you can close and come back</p>
