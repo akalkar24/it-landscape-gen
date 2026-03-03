@@ -216,43 +216,62 @@ async function buildPipeline(jobId, domain, brief, persona, apiKey) {
   const catData = parseJSON(extractText(catResp));
   const categories = catData.categories.map((c,i) => ({...c, id:i+1, color:CAT_COLORS[i%10][0], dim:CAT_COLORS[i%10][1]}));
   L(`✓ ${categories.length} categories`, 'success');
+  L(`  Waiting 20s before vendor discovery to clear rate limit window...`);
+  await new Promise(res => setTimeout(res, 20000));
 
-  // 1b — Vendors (batched 3 at a time to avoid rate limits)
+  // 1b — Vendors (sequential with retry)
   L(''); L(`── Stage 1b: Vendor Agent (batched, 3 per wave) ──`, 'stage');
   const vSchema = `{"vendors":[{"name":"str","type":"Legacy|AI-Native|Analyst","status":"Public|Private|Acquired|Division","ticker":"str|null","hq":"City, Country","founded":2015,"funding":150,"valuation":null,"round_type":"Series B|null","round_amount":50,"round_date":"Jan 2024|null","acq_price":null,"acquirer":null,"employees":500,"arr":80,"investors":"VC Names","agentic":true,"desc":"2 clear sentences. What it does and why buyers buy it.","products":"Product A, Product B, Product C","capabilities":"Cap 1; Cap 2; Cap 3; Cap 4"}]}`;
 
   const sleep = ms => new Promise(res => setTimeout(res, ms));
 
-  async function fetchVendorsForCat(cat) {
-    L(`  [${cat.phase}] Discovering vendors...`);
-    const r = await client.messages.create({
-      model:'claude-sonnet-4-20250514', max_tokens:4000,
-      system:`Research and profile 8-12 vendors for this technology market category. Use web search to verify financial data. If you cannot verify a figure, use null — null is better than a wrong number. Type definitions: Legacy=founded pre-2016 or traditional SaaS; AI-Native=LLM/ML-first product or founded to solve the problem with AI; Analyst=research/advisory firm. Output ONLY valid JSON.`,
-      tools:[{type:'web_search_20250305',name:'web_search'}],
-      messages:[{role:'user',content:`Domain: ${domain}\nCategory: ${cat.name} [${cat.phase} phase]\nDescription: ${cat.desc}\nKey capabilities: ${(cat.capabilities_preview||[]).join(', ')}\nBuyer: ${persona}\n\nFind 8-12 vendors. Balance ~50% Legacy, ~45% AI-Native, ~5% Analyst. Use web search to verify financials.\n\n${vSchema}`}]
-    });
-    const d = parseJSON(extractText(r));
-    const vends = (d.vendors||[]).map(v => ({...v, cat:cat.id}));
-    L(`  [${cat.phase}] ✓ ${vends.length} vendors`);
-    return vends;
+  // Retry wrapper — handles 429 rate limits with exponential backoff
+  async function withRetry(fn, label, maxRetries = 4) {
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        return await fn();
+      } catch(e) {
+        const is429 = e.status === 429 || (e.message||'').includes('rate_limit');
+        if (is429 && attempt < maxRetries) {
+          const wait = Math.pow(2, attempt + 1) * 15000; // 30s, 60s, 120s, 240s
+          L(`  [${label}] Rate limit hit — waiting ${wait/1000}s before retry ${attempt+1}/${maxRetries}...`, 'error');
+          await sleep(wait);
+        } else {
+          throw e;
+        }
+      }
+    }
   }
 
-  // Run in waves of 3 with a 15s pause between waves to stay under TPM limits
+  async function fetchVendorsForCat(cat) {
+    L(`  [${cat.phase}] Discovering vendors...`);
+    return withRetry(async () => {
+      const r = await client.messages.create({
+        model:'claude-sonnet-4-20250514', max_tokens:4000,
+        system:`Research and profile 8-12 vendors for this technology market category. Use web search to verify financial data. If you cannot verify a figure, use null — null is better than a wrong number. Type definitions: Legacy=founded pre-2016 or traditional SaaS; AI-Native=LLM/ML-first product or founded to solve the problem with AI; Analyst=research/advisory firm. Output ONLY valid JSON.`,
+        tools:[{type:'web_search_20250305',name:'web_search'}],
+        messages:[{role:'user',content:`Domain: ${domain}\nCategory: ${cat.name} [${cat.phase} phase]\nDescription: ${cat.desc}\nKey capabilities: ${(cat.capabilities_preview||[]).join(', ')}\nBuyer: ${persona}\n\nFind 8-12 vendors. Balance ~50% Legacy, ~45% AI-Native, ~5% Analyst. Use web search to verify financials.\n\n${vSchema}`}]
+      });
+      const d = parseJSON(extractText(r));
+      const vends = (d.vendors||[]).map(v => ({...v, cat:cat.id}));
+      L(`  [${cat.phase}] ✓ ${vends.length} vendors`);
+      return vends;
+    }, cat.phase);
+  }
+
+  // Run sequentially — one category at a time, 12s gap between each
+  // Web search calls are too token-heavy for parallel execution on free tier
   const vendors = [];
-  const WAVE_SIZE = 3;
-  for (let i = 0; i < categories.length; i += WAVE_SIZE) {
-    const wave = categories.slice(i, i + WAVE_SIZE);
-    L(`  Wave ${Math.floor(i/WAVE_SIZE)+1}: categories [${wave.map(c=>c.phase).join(', ')}]`);
-    const waveResults = await Promise.allSettled(wave.map(cat => fetchVendorsForCat(cat)));
-    waveResults.forEach((r, wi) => {
-      if (r.status === 'fulfilled') vendors.push(...r.value);
-      else L(`  [${wave[wi].phase}] ✗ ${r.reason?.message}`, 'error');
-    });
-    // Pause between waves (skip pause after last wave)
-    if (i + WAVE_SIZE < categories.length) {
-      L(`  Pausing 15s before next wave...`);
-      await sleep(15000);
+  for (let i = 0; i < categories.length; i++) {
+    const cat = categories[i];
+    try {
+      const vends = await fetchVendorsForCat(cat);
+      vendors.push(...vends);
+    } catch(e) {
+      L(`  [${cat.phase}] ✗ Failed after retries: ${e.message}`, 'error');
     }
+    // 12s gap between calls — keeps well under 30k TPM
+    if (i < categories.length - 1) await sleep(12000);
   }
   vendors.forEach((v,i) => { v.id=i+1; });
   L(`✓ ${vendors.length} total vendors`, 'success');
