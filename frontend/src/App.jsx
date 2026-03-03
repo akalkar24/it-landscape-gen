@@ -230,6 +230,12 @@ export default function App() {
   const [jobStatus, setJobStatus] = useState(null);
   const [error, setError] = useState(null);
   const [existingJson, setExistingJson] = useState("");
+  const [refreshTab, setRefreshTab] = useState("library"); // library | upload | paste
+  const [existingData, setExistingData] = useState(null);  // parsed landscape object
+  const [library, setLibrary] = useState([]);
+  const [libraryLoading, setLibraryLoading] = useState(false);
+  const [refreshInputLabel, setRefreshInputLabel] = useState(null); // display name of loaded landscape
+  const xlsxFileRef = useRef(null);
   const [reviewTab, setReviewTab] = useState("vendors");
   const [deploying, setDeploying] = useState(false);
   const [deployUrl, setDeployUrl] = useState(null);
@@ -254,12 +260,126 @@ export default function App() {
     return () => clearInterval(poll);
   }, [jobId, view]);
 
+  // Load library when switching to refresh mode
+  useEffect(() => {
+    if (mode !== 'refresh') return;
+    setLibraryLoading(true);
+    fetch(`${API}/api/library`).then(r=>r.json()).then(d=>{ setLibrary(d); setLibraryLoading(false); }).catch(()=>setLibraryLoading(false));
+  }, [mode]);
+
+  function parseExcelForRefresh(file) {
+    return new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+      script.onload = () => {
+        const reader = new FileReader();
+        reader.onload = e => {
+          try {
+            const XLSX = window.XLSX;
+            const wb = XLSX.read(e.target.result, { type:'array' });
+            // Parse Categories tab (index 1 — first tab is Summary in APM export)
+            const catSheet = wb.Sheets[wb.SheetNames.find(n=>n.toLowerCase().includes('categor'))||wb.SheetNames[1]];
+            const catRows = XLSX.utils.sheet_to_json(catSheet||wb.Sheets[wb.SheetNames[0]], { header:1 });
+            const CAT_COLORS = [["#3B82F6","rgba(59,130,246,0.1)"],["#8B5CF6","rgba(139,92,246,0.1)"],["#0D9488","rgba(13,148,136,0.1)"],["#D97706","rgba(217,119,6,0.1)"],["#DC2626","rgba(220,38,38,0.1)"],["#475569","rgba(71,85,105,0.15)"],["#0891B2","rgba(8,145,178,0.1)"],["#7C3AED","rgba(124,58,237,0.1)"],["#059669","rgba(5,150,105,0.1)"],["#BE185D","rgba(190,24,93,0.1)"]];
+            const hdr = catRows[0]||[];
+            const col = k => hdr.findIndex(h=>(h||'').toString().toLowerCase().includes(k.toLowerCase()));
+            const categories = catRows.slice(1).filter(r=>r[col('name')||col('categor')]||r[1]).map((r,i)=>({
+              id:i+1, phase:(r[col('phase')]||r[0]||'CAT'+(i+1)).toString().toUpperCase().slice(0,12),
+              name:(r[col('name')]||r[col('categor')]||r[1]||'Category '+(i+1)).toString(),
+              short:(r[col('short')]||r[2]||'').toString(),
+              market:(r[col('market')]||r[3]||'').toString(), cagr:(r[col('cagr')]||r[4]||'').toString(),
+              desc:(r[col('desc')]||r[5]||'').toString(),
+              capabilities_preview:((r[col('capabilit')]||r[6])||'').toString().split(',').map(x=>x.trim()).filter(Boolean),
+              gartner:(r[col('gartner')]||r[7]||'').toString(),
+              color:CAT_COLORS[i%10][0], dim:CAT_COLORS[i%10][1]
+            })).filter(c=>c.name&&!c.name.startsWith('─'));
+
+            // Parse Vendors tab
+            const vSheet = wb.Sheets[wb.SheetNames.find(n=>n.toLowerCase().includes('vendor'))||wb.SheetNames[2]];
+            const vRows = XLSX.utils.sheet_to_json(vSheet||wb.Sheets[wb.SheetNames[1]], { header:1 });
+            const vh = vRows[0]||[];
+            const vc = k => vh.findIndex(h=>(h||'').toString().toLowerCase().includes(k.toLowerCase()));
+            const catNameToId = Object.fromEntries(categories.map(c=>[c.name.toLowerCase().slice(0,20), c.id]));
+            const vendors = vRows.slice(1).filter(r=>r[vc('vendor')||vc('name')]||r[3]).map((r,i)=>{
+              const name = (r[vc('vendor')]||r[vc('name')]||r[3]||'').toString().trim();
+              const catRaw = (r[vc('categor')]||r[2]||'').toString().toLowerCase().slice(0,20);
+              const catId = Number(r[vc('cat id')]||r[1]) || catNameToId[catRaw] || Object.entries(catNameToId).find(([k])=>catRaw.includes(k.slice(0,10)))?.[1] || 1;
+              return {
+                id:i+1, cat:catId, name, type:(r[vc('type')]||r[4]||'Legacy').toString(),
+                status:(r[vc('status')]||r[5]||'Private').toString(),
+                founded:r[vc('founded')]?Number(r[vc('founded')]):null, hq:(r[vc('hq')]||r[7]||'').toString(),
+                ticker:(r[vc('ticker')]||r[8]||null)||null,
+                funding:r[vc('funding')]!=null?Number(r[vc('funding')])||null:null,
+                valuation:r[vc('valuat')]!=null?Number(r[vc('valuat')])||null:null,
+                arr:r[vc('arr')]!=null?Number(r[vc('arr')])||null:null,
+                employees:r[vc('employ')]!=null?Number(r[vc('employ')])||null:null,
+                investors:(r[vc('invest')]||'').toString(), agentic:(r[vc('agentic')]||'').toString().toLowerCase()==='yes',
+                desc:(r[vc('desc')]||r[20]||'').toString(), products:(r[vc('product')]||r[21]||'').toString(),
+                capabilities:(r[vc('capabilit')]||r[22]||'').toString()
+              };
+            }).filter(v=>v.name);
+
+            // Parse Capability Matrix tab
+            const capSheet = wb.Sheets[wb.SheetNames.find(n=>n.toLowerCase().includes('matrix')||n.toLowerCase().includes('capabilit'))||wb.SheetNames[3]];
+            const capRows = XLSX.utils.sheet_to_json(capSheet||wb.Sheets[wb.SheetNames[2]], { header:1 });
+            const capHdr = capRows[0]||[];
+            const vendorColStart = 4;
+            const vendorNamesInSheet = capHdr.slice(vendorColStart).map(v=>(v||'').toString());
+            const capabilities = capRows.slice(1).filter(r=>r[2]&&!r[2].toString().startsWith('─')).map(r=>({
+              cat: Number(r[0])||1,
+              name:(r[2]||'').toString(),
+              definition:(r[3]||'').toString(),
+              scores: Object.fromEntries(vendorNamesInSheet.map((vn,i)=>[vn, Number(r[vendorColStart+i])||0]).filter(([k])=>k))
+            }));
+
+            resolve({ categories, vendors, capabilities });
+          } catch(err) { reject(err); }
+        };
+        reader.readAsArrayBuffer(file);
+      };
+      if (window.XLSX) { script.onload(); } else { document.head.appendChild(script); }
+    });
+  }
+
+  async function handleRefreshFileUpload(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      if (file.name.endsWith('.json')) {
+        const text = await file.text();
+        const data = JSON.parse(text);
+        setExistingData(data);
+        setRefreshInputLabel(`${file.name} (JSON)`);
+        if (data.domain && !form.domain) setForm(p=>({...p, domain:data.domain}));
+      } else {
+        const data = await parseExcelForRefresh(file);
+        setExistingData(data);
+        setRefreshInputLabel(`${file.name} (Excel — ${data.vendors?.length||0} vendors, ${data.categories?.length||0} categories)`);
+      }
+    } catch(err) { setError('Could not parse file: ' + err.message); }
+    e.target.value = '';
+  }
+
+  async function handleRefreshFromLibrary(item) {
+    try {
+      const data = await fetch(`${API}/api/library/${item.id}`).then(r=>r.json());
+      setExistingData({ categories:data.categories, vendors:data.vendors, capabilities:data.capabilities });
+      setRefreshInputLabel(`${item.domain} — saved ${new Date(item.savedAt).toLocaleDateString()}`);
+      if (!form.domain) setForm(p=>({...p, domain:item.domain}));
+    } catch(err) { setError('Could not load: ' + err.message); }
+  }
+
   async function startJob() {
     setError(null); setLogs([]); setResult(null); setDeployUrl(null);
     try {
       const endpoint = mode === 'build' ? '/api/generate' : '/api/refresh';
       let body = { domain:form.domain, brief:form.brief, persona:form.persona, apiKey:form.apiKey };
-      if (mode === 'refresh') body.existingData = JSON.parse(existingJson);
+      if (mode === 'refresh') {
+        let parsed = existingData;
+        if (!parsed && existingJson.trim()) { try { parsed = JSON.parse(existingJson); } catch { setError('Invalid JSON — check the paste tab'); return; } }
+        if (!parsed) { setError('Load a landscape first — from library, file upload, or paste'); return; }
+        body.existingData = parsed;
+      }
       const resp = await fetch(`${API}${endpoint}`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
       const d = await resp.json();
       if (!resp.ok) { setError(d.error); return; }
@@ -379,11 +499,76 @@ export default function App() {
                 <textarea value={form.brief} onChange={e=>setForm(p=>({...p,brief:e.target.value}))} rows={8} placeholder="Describe the domain, scope, key vendors, and what's out of scope..." style={{width:'100%',padding:'10px 13px',background:'var(--surface)',border:'1px solid var(--border)',borderRadius:7,color:'var(--text)',fontFamily:'var(--fs)',fontSize:13,outline:'none',resize:'vertical',lineHeight:1.65}}/>
               </div>
 
-              {/* Refresh JSON input */}
+              {/* Refresh — 3-tab landscape loader */}
               {mode==='refresh' && (
-                <div>
-                  <label style={{fontFamily:'var(--fm)',fontSize:9,color:'var(--muted)',letterSpacing:2,textTransform:'uppercase',display:'block',marginBottom:7}}>Existing Landscape JSON *</label>
-                  <textarea value={existingJson} onChange={e=>setExistingJson(e.target.value)} rows={4} placeholder='Paste existing JSON: {"categories":[...],"vendors":[...],"capabilities":[...]}' style={{width:'100%',padding:'10px 13px',background:'var(--surface)',border:'1px solid var(--border)',borderRadius:7,color:'var(--text)',fontFamily:'var(--fm)',fontSize:11,outline:'none',resize:'vertical'}}/>
+                <div style={{border:'1px solid var(--border)',borderRadius:10,overflow:'hidden'}}>
+                  {/* Tab bar */}
+                  <div style={{display:'flex',borderBottom:'1px solid var(--border)'}}>
+                    {[['library','📚 Saved Landscapes'],['upload','↑ Upload File'],['paste','{ } Paste JSON']].map(([t,lbl])=>(
+                      <button key={t} onClick={()=>setRefreshTab(t)} style={{flex:1,padding:'9px 0',border:'none',cursor:'pointer',fontFamily:'var(--fm)',fontSize:10,background:refreshTab===t?'var(--s2)':'transparent',color:refreshTab===t?'var(--text)':'var(--muted)',borderBottom:refreshTab===t?'2px solid var(--blue)':'2px solid transparent'}}>
+                        {lbl}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Library tab */}
+                  {refreshTab==='library' && (
+                    <div style={{padding:'14px',minHeight:120,maxHeight:240,overflowY:'auto'}}>
+                      {libraryLoading && <div style={{color:'var(--muted)',fontSize:12,fontFamily:'var(--fm)'}}>Loading saved landscapes...</div>}
+                      {!libraryLoading && library.length===0 && (
+                        <div style={{color:'var(--muted)',fontSize:12,textAlign:'center',padding:'20px 0'}}>
+                          No saved landscapes yet.<br/>
+                          <span style={{fontSize:11,opacity:.6}}>Landscapes are auto-saved when you approve a run.</span>
+                        </div>
+                      )}
+                      {library.map(item=>(
+                        <div key={item.id} onClick={()=>handleRefreshFromLibrary(item)}
+                          style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'10px 12px',borderRadius:7,cursor:'pointer',marginBottom:6,
+                          background:refreshInputLabel?.startsWith(item.domain)?'rgba(59,130,246,0.1)':'rgba(255,255,255,0.02)',
+                          border:`1px solid ${refreshInputLabel?.startsWith(item.domain)?'rgba(59,130,246,0.3)':'rgba(255,255,255,0.06)'}`}}>
+                          <div>
+                            <div style={{fontWeight:600,fontSize:13,marginBottom:2}}>{item.domain}</div>
+                            <div style={{fontSize:10,color:'var(--muted)',fontFamily:'var(--fm)'}}>{item.vendorCount} vendors · {item.categoryCount} categories · saved {new Date(item.savedAt).toLocaleDateString()}</div>
+                          </div>
+                          <div style={{fontSize:11,color:'var(--blue)',fontFamily:'var(--fm)'}}>Select →</div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Upload tab */}
+                  {refreshTab==='upload' && (
+                    <div style={{padding:'20px',textAlign:'center'}}>
+                      <input ref={xlsxFileRef} type="file" accept=".json,.xlsx,.xls" onChange={handleRefreshFileUpload} style={{display:'none'}}/>
+                      <div style={{marginBottom:12,color:'var(--muted)',fontSize:12,lineHeight:1.6}}>
+                        Upload the Excel export from a previous landscape<br/>
+                        <span style={{fontSize:11,opacity:.6}}>(.xlsx or .xls) — or a JSON export (.json)</span>
+                      </div>
+                      <button onClick={()=>xlsxFileRef.current?.click()} style={{padding:'9px 22px',background:'rgba(59,130,246,0.1)',border:'1px solid rgba(59,130,246,0.3)',borderRadius:7,color:'var(--blue)',cursor:'pointer',fontFamily:'var(--fm)',fontSize:11,fontWeight:600}}>
+                        Choose File
+                      </button>
+                      {refreshInputLabel && refreshTab==='upload' && (
+                        <div style={{marginTop:10,fontSize:11,color:'var(--green)',fontFamily:'var(--fm)'}}>✓ {refreshInputLabel}</div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Paste tab */}
+                  {refreshTab==='paste' && (
+                    <div style={{padding:'12px'}}>
+                      <textarea value={existingJson} onChange={e=>setExistingJson(e.target.value)} rows={5}
+                        placeholder='{"categories":[...],"vendors":[...],"capabilities":[...]}'
+                        style={{width:'100%',padding:'10px 13px',background:'transparent',border:'none',color:'var(--text)',fontFamily:'var(--fm)',fontSize:11,outline:'none',resize:'vertical'}}/>
+                    </div>
+                  )}
+
+                  {/* Selected landscape indicator */}
+                  {refreshInputLabel && refreshTab!=='upload' && (
+                    <div style={{padding:'8px 14px',borderTop:'1px solid var(--border)',display:'flex',justifyContent:'space-between',alignItems:'center',background:'rgba(16,185,129,0.04)'}}>
+                      <div style={{fontSize:11,color:'var(--green)',fontFamily:'var(--fm)'}}>✓ Loaded: {refreshInputLabel}</div>
+                      <button onClick={()=>{setExistingData(null);setRefreshInputLabel(null);setExistingJson('');}} style={{fontSize:10,color:'var(--muted)',background:'none',border:'none',cursor:'pointer',fontFamily:'var(--fm)'}}>✕ clear</button>
+                    </div>
+                  )}
                 </div>
               )}
 
