@@ -58,7 +58,7 @@ const sseListeners = new Map();
 
 function createJob(domain, mode) {
   const id = randomUUID();
-  jobs.set(id, { id, domain, mode, status:'running', logs:[], result:null, error:null, startedAt:new Date().toISOString() });
+  jobs.set(id, { id, domain, mode, status:'running', logs:[], result:null, error:null, cancelled:false, startedAt:new Date().toISOString() });
   return id;
 }
 
@@ -88,6 +88,17 @@ function fail(jobId, error) {
 
 // ── ROUTES ────────────────────────────────────────────────────────────────────
 app.get('/api/health', (_, res) => res.json({ ok:true, jobs:jobs.size, uptime:process.uptime() }));
+
+app.post('/api/job/:id/cancel', (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error:'Not found' });
+  if (job.status !== 'running') return res.status(400).json({ error:'Job not running' });
+  job.cancelled = true;
+  job.status = 'cancelled';
+  log(req.params.id, 'Run cancelled by user', 'error');
+  (sseListeners.get(req.params.id)||[]).forEach(r => { try { r.write('data: ' + JSON.stringify({msg:'__ERROR__',level:'system'}) + '\n\n'); r.end(); } catch {} });
+  res.json({ ok:true });
+});
 // ── LIBRARY ROUTES ────────────────────────────────────────────────────────────
 app.get('/api/library', (_, res) => res.json(libraryList()));
 
@@ -273,16 +284,13 @@ async function buildPipeline(jobId, domain, brief, persona, apiKey) {
   // 1a — Categories
   L(''); L('── Stage 1a: Category Agent ──────────────────', 'stage');
   const catResp = await client.messages.create({
-    model:'claude-sonnet-4-20250514', max_tokens:8000,
-    system:`You are a senior technology analyst. Build a MECE value-chain taxonomy of 8-10 categories for the given technology domain. Categories flow left to right: discovery/awareness → execution → optimization/renewal. Market sizes from Gartner/IDC/MarketsandMarkets. Phase labels are short ALL CAPS verbs (DISCOVER, MAP, GOVERN, OPTIMIZE, RENEW etc). Output ONLY valid JSON, no preamble.`,
-    tools:[{type:'web_search_20250305',name:'web_search'}],
+    model:'claude-sonnet-4-20250514', max_tokens:3000,
+    system:`You are a senior technology analyst. Build a MECE value-chain taxonomy of 8-10 categories for the given technology domain from your training knowledge. Categories flow left to right: discovery/awareness → execution → optimization/renewal. Market sizes from Gartner/IDC/MarketsandMarkets. Phase labels are short ALL CAPS verbs (DISCOVER, MAP, GOVERN, OPTIMIZE, RENEW etc). Output ONLY valid JSON, no preamble.`,
     messages:[{role:'user',content:`Domain: ${domain}\nPersona: ${persona}\nBrief:\n${brief}\n\nOutput: {"categories":[{"id":1,"phase":"VERB","name":"Full Name","short":"Short (2-3 words)","market":"$XB","cagr":"X%","desc":"2-3 sentence description of what this category does and why it matters to the buyer.","capabilities_preview":["5 specific capability names"],"gartner":"Official Gartner segment name"}]}`}]
   });
   const catData = parseJSON(extractText(catResp));
   const categories = catData.categories.map((c,i) => ({...c, id:i+1, color:CAT_COLORS[i%10][0], dim:CAT_COLORS[i%10][1]}));
   L(`✓ ${categories.length} categories`, 'success');
-  L(`  Waiting 60s for TPM window to reset after category agent...`);
-  await new Promise(res => setTimeout(res, 60000));
 
   // 1b — Vendors (sequential with retry)
   L(''); L(`── Stage 1b: Vendor Agent (sequential, no web search) ──`, 'stage');
@@ -327,6 +335,7 @@ async function buildPipeline(jobId, domain, brief, persona, apiKey) {
   // Sequential to be safe; gaps keep us well under TPM limits
   const vendors = [];
   for (let i = 0; i < categories.length; i++) {
+    if (jobs.get(jobId)?.cancelled) { L('Run cancelled', 'error'); return; }
     const cat = categories[i];
     try {
       const vends = await fetchVendorsForCat(cat);
