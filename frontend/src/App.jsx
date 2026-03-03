@@ -254,7 +254,7 @@ export default function App() {
   if (!jobId || view !== "running") return;
   const poll = setInterval(async () => {
   try {
-  const d = await fetch(${API}/api/job/${jobId}/result).then(r=>r.json());
+    const d = await fetch(`${API}/api/job/${jobId}/result`).then(r=>r.json());
   if (d.status === 'review') {
   setResult(d.result); setJobStatus('review'); setView('review'); clearInterval(poll);
   } else if (d.status === 'error') {
