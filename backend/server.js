@@ -217,29 +217,43 @@ async function buildPipeline(jobId, domain, brief, persona, apiKey) {
   const categories = catData.categories.map((c,i) => ({...c, id:i+1, color:CAT_COLORS[i%10][0], dim:CAT_COLORS[i%10][1]}));
   L(`✓ ${categories.length} categories`, 'success');
 
-  // 1b — Vendors (parallel per category)
-  L(''); L(`── Stage 1b: Vendor Agent (${categories.length} parallel calls) ──`, 'stage');
+  // 1b — Vendors (batched 3 at a time to avoid rate limits)
+  L(''); L(`── Stage 1b: Vendor Agent (batched, 3 per wave) ──`, 'stage');
   const vSchema = `{"vendors":[{"name":"str","type":"Legacy|AI-Native|Analyst","status":"Public|Private|Acquired|Division","ticker":"str|null","hq":"City, Country","founded":2015,"funding":150,"valuation":null,"round_type":"Series B|null","round_amount":50,"round_date":"Jan 2024|null","acq_price":null,"acquirer":null,"employees":500,"arr":80,"investors":"VC Names","agentic":true,"desc":"2 clear sentences. What it does and why buyers buy it.","products":"Product A, Product B, Product C","capabilities":"Cap 1; Cap 2; Cap 3; Cap 4"}]}`;
 
-  const vendorResults = await Promise.allSettled(categories.map(async cat => {
+  const sleep = ms => new Promise(res => setTimeout(res, ms));
+
+  async function fetchVendorsForCat(cat) {
     L(`  [${cat.phase}] Discovering vendors...`);
     const r = await client.messages.create({
-      model:'claude-sonnet-4-20250514', max_tokens:8000,
-      system:`Research and profile 10-15 vendors for this technology market category. Use web search to verify financial data. If you cannot verify a figure, use null — null is better than a wrong number. Type definitions: Legacy=founded pre-2016 or traditional SaaS; AI-Native=LLM/ML-first product or founded to solve the problem with AI; Analyst=research/advisory firm. Output ONLY valid JSON.`,
+      model:'claude-sonnet-4-20250514', max_tokens:4000,
+      system:`Research and profile 8-12 vendors for this technology market category. Use web search to verify financial data. If you cannot verify a figure, use null — null is better than a wrong number. Type definitions: Legacy=founded pre-2016 or traditional SaaS; AI-Native=LLM/ML-first product or founded to solve the problem with AI; Analyst=research/advisory firm. Output ONLY valid JSON.`,
       tools:[{type:'web_search_20250305',name:'web_search'}],
-      messages:[{role:'user',content:`Domain: ${domain}\nCategory: ${cat.name} [${cat.phase} phase]\nDescription: ${cat.desc}\nKey capabilities: ${(cat.capabilities_preview||[]).join(', ')}\nBuyer: ${persona}\n\nFind 10-15 vendors. Balance ~50% Legacy, ~45% AI-Native, ~5% Analyst. Use web search to verify: funding raised, last valuation, ARR, acquisition details for each.\n\n${vSchema}`}]
+      messages:[{role:'user',content:`Domain: ${domain}\nCategory: ${cat.name} [${cat.phase} phase]\nDescription: ${cat.desc}\nKey capabilities: ${(cat.capabilities_preview||[]).join(', ')}\nBuyer: ${persona}\n\nFind 8-12 vendors. Balance ~50% Legacy, ~45% AI-Native, ~5% Analyst. Use web search to verify financials.\n\n${vSchema}`}]
     });
     const d = parseJSON(extractText(r));
     const vends = (d.vendors||[]).map(v => ({...v, cat:cat.id}));
     L(`  [${cat.phase}] ✓ ${vends.length} vendors`);
     return vends;
-  }));
+  }
 
+  // Run in waves of 3 with a 15s pause between waves to stay under TPM limits
   const vendors = [];
-  vendorResults.forEach((r,i) => {
-    if(r.status==='fulfilled') vendors.push(...r.value);
-    else L(`  [Cat ${categories[i].id}] ✗ ${r.reason?.message}`, 'error');
-  });
+  const WAVE_SIZE = 3;
+  for (let i = 0; i < categories.length; i += WAVE_SIZE) {
+    const wave = categories.slice(i, i + WAVE_SIZE);
+    L(`  Wave ${Math.floor(i/WAVE_SIZE)+1}: categories [${wave.map(c=>c.phase).join(', ')}]`);
+    const waveResults = await Promise.allSettled(wave.map(cat => fetchVendorsForCat(cat)));
+    waveResults.forEach((r, wi) => {
+      if (r.status === 'fulfilled') vendors.push(...r.value);
+      else L(`  [${wave[wi].phase}] ✗ ${r.reason?.message}`, 'error');
+    });
+    // Pause between waves (skip pause after last wave)
+    if (i + WAVE_SIZE < categories.length) {
+      L(`  Pausing 15s before next wave...`);
+      await sleep(15000);
+    }
+  }
   vendors.forEach((v,i) => { v.id=i+1; });
   L(`✓ ${vendors.length} total vendors`, 'success');
 
