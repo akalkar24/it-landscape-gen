@@ -6,13 +6,47 @@
 import express from 'express';
 import cors from 'cors';
 import { randomUUID } from 'crypto';
-import { readFileSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import Anthropic from '@anthropic-ai/sdk';
 
 const __dir = dirname(fileURLToPath(import.meta.url));
 const TEMPLATE = readFileSync(join(__dir, 'landscape-template.html'), 'utf8');
+
+// ── LANDSCAPE LIBRARY (persistent to /data or ./library) ─────────────────────
+// Railway: attach a Volume mounted at /data for persistence across deploys
+// Local dev: falls back to ./library folder
+const LIBRARY_DIR = existsSync('/data') ? '/data/landscapes' : join(__dir, 'library');
+if (!existsSync(LIBRARY_DIR)) mkdirSync(LIBRARY_DIR, { recursive: true });
+
+function libraryList() {
+  try {
+    return readdirSync(LIBRARY_DIR)
+      .filter(f => f.endsWith('.json'))
+      .map(f => {
+        try {
+          const meta = JSON.parse(readFileSync(join(LIBRARY_DIR, f), 'utf8'));
+          return { id: f.replace('.json',''), domain: meta.domain, savedAt: meta.savedAt,
+                   vendorCount: meta.vendors?.length||0, categoryCount: meta.categories?.length||0 };
+        } catch { return null; }
+      }).filter(Boolean).sort((a,b) => b.savedAt.localeCompare(a.savedAt));
+  } catch { return []; }
+}
+
+function librarySave(domain, data) {
+  const id = `${domain.toLowerCase().replace(/[^a-z0-9]+/g,'-').slice(0,40)}-${Date.now()}`;
+  const payload = { domain, savedAt: new Date().toISOString(), ...data };
+  writeFileSync(join(LIBRARY_DIR, `${id}.json`), JSON.stringify(payload));
+  return id;
+}
+
+function libraryGet(id) {
+  const fp = join(LIBRARY_DIR, `${id}.json`);
+  if (!existsSync(fp)) return null;
+  return JSON.parse(readFileSync(fp, 'utf8'));
+}
+
 
 const app = express();
 app.use(cors());
@@ -54,6 +88,31 @@ function fail(jobId, error) {
 
 // ── ROUTES ────────────────────────────────────────────────────────────────────
 app.get('/api/health', (_, res) => res.json({ ok:true, jobs:jobs.size, uptime:process.uptime() }));
+// ── LIBRARY ROUTES ────────────────────────────────────────────────────────────
+app.get('/api/library', (_, res) => res.json(libraryList()));
+
+app.get('/api/library/:id', (req, res) => {
+  const data = libraryGet(req.params.id);
+  if (!data) return res.status(404).json({ error:'Not found' });
+  res.json(data);
+});
+
+app.post('/api/library', (req, res) => {
+  const { domain, categories, vendors, capabilities } = req.body;
+  if (!domain || !categories || !vendors || !capabilities)
+    return res.status(400).json({ error:'domain, categories, vendors, capabilities required' });
+  const id = librarySave(domain, { categories, vendors, capabilities });
+  res.json({ id });
+});
+
+app.delete('/api/library/:id', (req, res) => {
+  const fp = join(LIBRARY_DIR, `${req.params.id}.json`);
+  if (!existsSync(fp)) return res.status(404).json({ error:'Not found' });
+  try { import('fs').then(({unlinkSync})=>unlinkSync(fp)); res.json({ ok:true }); }
+  catch(e) { res.status(500).json({ error:e.message }); }
+});
+
+
 
 app.post('/api/generate', (req, res) => {
   const { domain, brief, persona='CIO', apiKey } = req.body;
@@ -99,7 +158,13 @@ app.post('/api/job/:id/approve', (req, res) => {
   if (!job || job.status !== 'review') return res.status(400).json({ error:'Job not in review state' });
   if (req.body.result) job.result = req.body.result;
   job.status = 'approved';
-  res.json({ ok:true });
+  // Auto-save to library on approve
+  try {
+    const { categories, vendors, capabilities } = job.result;
+    const libId = librarySave(job.domain, { categories, vendors, capabilities });
+    job.libraryId = libId;
+  } catch(e) { console.error('Library save failed:', e.message); }
+  res.json({ ok:true, libraryId: job.libraryId });
 });
 
 // ── DEPLOY TO VERCEL ──────────────────────────────────────────────────────────
@@ -216,11 +281,11 @@ async function buildPipeline(jobId, domain, brief, persona, apiKey) {
   const catData = parseJSON(extractText(catResp));
   const categories = catData.categories.map((c,i) => ({...c, id:i+1, color:CAT_COLORS[i%10][0], dim:CAT_COLORS[i%10][1]}));
   L(`✓ ${categories.length} categories`, 'success');
-  L(`  Waiting 20s before vendor discovery to clear rate limit window...`);
-  await new Promise(res => setTimeout(res, 20000));
+  L(`  Waiting 10s before vendor discovery...`);
+  await new Promise(res => setTimeout(res, 10000));
 
   // 1b — Vendors (sequential with retry)
-  L(''); L(`── Stage 1b: Vendor Agent (batched, 3 per wave) ──`, 'stage');
+  L(''); L(`── Stage 1b: Vendor Agent (sequential, no web search) ──`, 'stage');
   const vSchema = `{"vendors":[{"name":"str","type":"Legacy|AI-Native|Analyst","status":"Public|Private|Acquired|Division","ticker":"str|null","hq":"City, Country","founded":2015,"funding":150,"valuation":null,"round_type":"Series B|null","round_amount":50,"round_date":"Jan 2024|null","acq_price":null,"acquirer":null,"employees":500,"arr":80,"investors":"VC Names","agentic":true,"desc":"2 clear sentences. What it does and why buyers buy it.","products":"Product A, Product B, Product C","capabilities":"Cap 1; Cap 2; Cap 3; Cap 4"}]}`;
 
   const sleep = ms => new Promise(res => setTimeout(res, ms));
@@ -248,9 +313,8 @@ async function buildPipeline(jobId, domain, brief, persona, apiKey) {
     return withRetry(async () => {
       const r = await client.messages.create({
         model:'claude-sonnet-4-20250514', max_tokens:4000,
-        system:`Research and profile 8-12 vendors for this technology market category. Use web search to verify financial data. If you cannot verify a figure, use null — null is better than a wrong number. Type definitions: Legacy=founded pre-2016 or traditional SaaS; AI-Native=LLM/ML-first product or founded to solve the problem with AI; Analyst=research/advisory firm. Output ONLY valid JSON.`,
-        tools:[{type:'web_search_20250305',name:'web_search'}],
-        messages:[{role:'user',content:`Domain: ${domain}\nCategory: ${cat.name} [${cat.phase} phase]\nDescription: ${cat.desc}\nKey capabilities: ${(cat.capabilities_preview||[]).join(', ')}\nBuyer: ${persona}\n\nFind 8-12 vendors. Balance ~50% Legacy, ~45% AI-Native, ~5% Analyst. Use web search to verify financials.\n\n${vSchema}`}]
+        system:`You are a senior technology analyst. Profile 8-12 vendors for this market category from your training knowledge. For public companies include known revenue/ARR. For private companies use last known funding round. Set unknown financials to null - null is better than a wrong number. Legacy=founded pre-2016 or traditional SaaS; AI-Native=LLM/ML-first product, founded post-2018 with AI core; Analyst=research/advisory firm. Output ONLY valid JSON.`,
+        messages:[{role:'user',content:`Domain: ${domain}\nCategory: ${cat.name} [${cat.phase} phase]\nDescription: ${cat.desc}\nKey capabilities: ${(cat.capabilities_preview||[]).join(', ')}\nBuyer: ${persona}\n\nFind 8-12 vendors. Balance ~50% Legacy, ~45% AI-Native, ~5% Analyst.\n\n${vSchema}`}]
       });
       const d = parseJSON(extractText(r));
       const vends = (d.vendors||[]).map(v => ({...v, cat:cat.id}));
@@ -260,7 +324,7 @@ async function buildPipeline(jobId, domain, brief, persona, apiKey) {
   }
 
   // Run sequentially — one category at a time, 12s gap between each
-  // Web search calls are too token-heavy for parallel execution on free tier
+  // Sequential to be safe; gaps keep us well under TPM limits
   const vendors = [];
   for (let i = 0; i < categories.length; i++) {
     const cat = categories[i];
@@ -271,13 +335,72 @@ async function buildPipeline(jobId, domain, brief, persona, apiKey) {
       L(`  [${cat.phase}] ✗ Failed after retries: ${e.message}`, 'error');
     }
     // 12s gap between calls — keeps well under 30k TPM
-    if (i < categories.length - 1) await sleep(12000);
+    if (i < categories.length - 1) await sleep(5000);
   }
   vendors.forEach((v,i) => { v.id=i+1; });
   L(`✓ ${vendors.length} total vendors`, 'success');
 
-  // 1c — Scoring (batched)
-  L(''); L('── Stage 1c: Scoring Agent ───────────────────', 'stage');
+
+  // 1c — Verification (3 web search calls, one per category batch)
+  L(''); L('── Stage 1c: Verification Agent (web search gap-check) ──', 'stage');
+  L(`  Checking for missing vendors — especially recent AI-native startups...`);
+  await sleep(15000); // Let TPM window clear before web search
+
+  const verifySchema = `{"new_vendors":[{"name":"str","type":"AI-Native|Legacy","status":"Private|Public","hq":"City, Country","founded":2020,"funding":30,"valuation":null,"round_type":"Series A|null","round_amount":30,"round_date":"Jan 2025|null","acq_price":null,"acquirer":null,"employees":80,"arr":null,"investors":"VC Names","agentic":true,"cat":1,"desc":"2 sentences.","products":"Product A, B","capabilities":"Cap 1; Cap 2"}]}`;
+
+  const catBatchesV = [];
+  for(let i=0; i<categories.length; i+=3) catBatchesV.push(categories.slice(i,i+3));
+
+  const verifiedNewVendors = [];
+  const existingNames = new Set(vendors.map(v => v.name.toLowerCase()));
+
+  for(let bi=0; bi<catBatchesV.length; bi++) {
+    const batch = catBatchesV[bi];
+    L(`  Verifying batch ${bi+1}/${catBatchesV.length}: [${batch.map(c=>c.phase).join(', ')}]`);
+    const existingInBatch = vendors.filter(v => batch.some(c => c.id === v.cat)).map(v => v.name);
+
+    try {
+      const rv = await withRetry(async () => client.messages.create({
+        model:'claude-sonnet-4-20250514', max_tokens:4000,
+        system:`You are a technology analyst finding gaps in a vendor landscape. Find notable vendors MISSED in the initial pass — especially recently funded AI-native startups (last 18 months), niche specialists, recently acquired companies. Only return vendors you can verify exist via web search. Output ONLY valid JSON.`,
+        tools:[{type:'web_search_20250305',name:'web_search'}],
+        messages:[{role:'user',content:`Domain: ${domain}
+Categories: ${batch.map(c=>`[${c.phase}] ${c.name}`).join(' | ')}
+
+Already in landscape (DO NOT repeat): ${existingInBatch.join(', ')}
+
+Search for:
+1. AI-native startups in these categories that raised funding in last 18 months
+2. Market leaders or frequently cited vendors missing from above list
+3. Recently acquired companies notable in this space
+
+Return 2-5 genuinely new vendors NOT already listed. Assign each to the most relevant cat ID (${batch.map(c=>`${c.id}=${c.phase}`).join(', ')}).
+
+${verifySchema}`}]
+      }), `verify-${bi+1}`);
+
+      const dv = parseJSON(extractText(rv));
+      const newOnes = (dv.new_vendors||[]).filter(v => !existingNames.has(v.name.toLowerCase()));
+      newOnes.forEach(v => existingNames.add(v.name.toLowerCase()));
+      verifiedNewVendors.push(...newOnes);
+      L(`  ✓ Batch ${bi+1}: +${newOnes.length} new vendors`, 'success');
+    } catch(e) {
+      L(`  ✗ Verify batch ${bi+1} failed: ${e.message}`, 'error');
+    }
+    if(bi < catBatchesV.length - 1) await sleep(20000);
+  }
+
+  if(verifiedNewVendors.length > 0) {
+    const startId = vendors.length + 1;
+    verifiedNewVendors.forEach((v,i) => { v.id = startId + i; });
+    vendors.push(...verifiedNewVendors);
+    L(`✓ Verification complete — +${verifiedNewVendors.length} added (${vendors.length} total)`, 'success');
+  } else {
+    L(`✓ Verification complete — no gaps found`, 'success');
+  }
+
+  // 1d — Scoring (batched)
+  L(''); L('── Stage 1d: Scoring Agent ───────────────────', 'stage');
   const allVendorNames = [...new Set(vendors.map(v=>v.name))];
   const capabilities = [];
   const batches = [];
