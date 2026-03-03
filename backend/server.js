@@ -281,8 +281,8 @@ async function buildPipeline(jobId, domain, brief, persona, apiKey) {
   const catData = parseJSON(extractText(catResp));
   const categories = catData.categories.map((c,i) => ({...c, id:i+1, color:CAT_COLORS[i%10][0], dim:CAT_COLORS[i%10][1]}));
   L(`✓ ${categories.length} categories`, 'success');
-  L(`  Waiting 10s before vendor discovery...`);
-  await new Promise(res => setTimeout(res, 10000));
+  L(`  Waiting 60s for TPM window to reset after category agent...`);
+  await new Promise(res => setTimeout(res, 60000));
 
   // 1b — Vendors (sequential with retry)
   L(''); L(`── Stage 1b: Vendor Agent (sequential, no web search) ──`, 'stage');
