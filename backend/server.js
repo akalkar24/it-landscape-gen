@@ -489,9 +489,10 @@ ${batch.map(c=>`Cat ${c.id} [${c.phase}] ${c.name}\n  Preview caps: ${(c.capabil
 Vendors in these categories:
 ${bVendors.map(v=>`  [${v.type}] ${v.name} (Cat ${v.cat}): ${(v.desc||'').slice(0,90)}`).join('\n')}
 
-ALL vendor names for scores dict: ${allVendorNames.join(', ')}
+Vendor names to score: ${bVendors.map(v=>v.name).join(', ')}
 
-Define EXACTLY 5 capabilities per category. Score ALL vendors in every capability's scores dict (use 0 if not applicable).
+Define EXACTLY 5 capabilities per category. Score ONLY the vendors listed above (use 0 if not applicable).
+
 Output: {"capabilities":[{"cat":1,"name":"Specific Capability Name","definition":"One sentence what this does and why it matters.","scores":{"VendorName":85,"Other":0}}]}`}]
           }),
           120000, `scoring-${bIds.join(',')}`
@@ -529,10 +530,12 @@ Category: Cat ${cat.id} [${cat.phase}] ${cat.name}
 Preview capabilities: ${(cat.capabilities_preview||[]).join(', ')}
 
 Vendors: ${catVendors.map(v=>`${v.name} [${v.type}]`).join(', ')}
-ALL vendor names: ${allVendorNames.join(', ')}
 
-Define EXACTLY 5 capabilities for this category. Score ALL vendors (0 if not applicable).
-Output: {"capabilities":[{"cat":${cat.id},"name":"Capability Name","definition":"One sentence definition.","scores":{"VendorName":75}}]}`}]
+Vendor names to score: ${catVendors.map(v=>v.name).join(', ')}
+
+Define EXACTLY 5 capabilities for this category. Score ONLY the vendors listed above (0 if not applicable).
+Output: {"capabilities":[{"cat":${cat.id},"name":"Capability Name","definition":"One sentence.","scores":{"VendorName":75}}]}`}]
+        
             }),
             90000, `topup-${cat.phase}`
           ), `topup-${cat.phase}`, 2);
@@ -628,10 +631,12 @@ Category: Cat ${cat.id} [${cat.phase}] ${cat.name}
 Preview capabilities: ${(cat.capabilities_preview||[]).join(', ')}
 
 Vendors in this category: ${catVendors.map(v=>`${v.name} [${v.type}]`).join(', ')}
-ALL vendor names for scores: ${allVendorNamesCheck.join(', ')}
 
-Define EXACTLY 5 capabilities for this category. Score ALL vendors (0 if not applicable).
+Vendor names to score: ${catVendors.map(v=>v.name).join(', ')}
+
+Define EXACTLY 5 capabilities for this category. Score ONLY the vendors listed above (0 if not applicable).
 Output: {"capabilities":[{"cat":${cat.id},"name":"Capability Name","definition":"One sentence.","scores":{"VendorName":75}}]}`}]
+
             }),
             90000, `cap-topup-${cat.phase}`
           ), `cap-topup-${cat.phase}`, 2);
