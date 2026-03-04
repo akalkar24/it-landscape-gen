@@ -289,9 +289,9 @@ async function buildPipeline(jobId, domain, brief, persona, apiKey) {
 
   // FIX 2: Two clients — standard for non-search calls, wsClient for web_search tool calls
   // The web_search tool requires the 'anthropic-beta: web-search-2025-03-05' header
-  const client   = new Anthropic({ apiKey });
-  const wsClient = new Anthropic({ apiKey, defaultHeaders: { 'anthropic-beta': 'web-search-2025-03-05' } });
-
+  const client   = new Anthropic({ apiKey, timeout: 90000 });
+  const wsClient = new Anthropic({ apiKey, timeout: 120000, defaultHeaders: { 'anthropic-beta': 'web-search-2025-03-05' } });
+  
   const L = (m,lv='info') => log(jobId,m,lv);
 
   // FIX 3: Cancellation guard — throws so all awaits unwind immediately when user hits Stop
@@ -327,8 +327,10 @@ async function buildPipeline(jobId, domain, brief, persona, apiKey) {
       } catch(e) {
         if (e.message === '__CANCELLED__') throw e;
         const is429 = e.status === 429 || (e.message||'').includes('rate_limit');
-        if (is429 && attempt < maxRetries) {
-          const wait = Math.pow(2, attempt + 1) * 15000; // 30s, 60s, 120s, 240s
+        const isTimeout = (e.message||'').toLowerCase().includes('timeout') || e.code === 'ETIMEDOUT' || e.name === 'APIConnectionTimeoutError';
+        if ((is429 || isTimeout) && attempt < maxRetries) {
+        const wait = is429 ? Math.pow(2, attempt + 1) * 15000 : 20000; // timeouts retry after flat 20s
+    
           L(`  [${label}] Rate limit hit — waiting ${wait/1000}s before retry ${attempt+1}/${maxRetries}...`, 'error');
           await sleep(wait);
         } else {
@@ -487,9 +489,9 @@ async function refreshPipeline(jobId, domain, existingData, brief, persona, apiK
   const MODEL = 'claude-sonnet-4-6';
 
   // FIX: two clients — wsClient for web_search calls, client for everything else
-  const client   = new Anthropic({ apiKey });
-  const wsClient = new Anthropic({ apiKey, defaultHeaders: { 'anthropic-beta': 'web-search-2025-03-05' } });
-
+  const client   = new Anthropic({ apiKey, timeout: 90000 });
+  const wsClient = new Anthropic({ apiKey, timeout: 120000, defaultHeaders: { 'anthropic-beta': 'web-search-2025-03-05' } });
+  
   const L = (m,lv='info') => log(jobId,m,lv);
   const checkCancelled = () => { if (jobs.get(jobId)?.cancelled) throw new Error('__CANCELLED__'); };
 
