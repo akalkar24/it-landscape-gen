@@ -454,27 +454,29 @@ if (verifiedNewVendors.length > 0) {
 } else {
   L('✓ Verification complete — no gaps found', 'success');
 }
-  
-  // ── Stage 1d: Scoring (3 categories per batch) ────────────────────────────
+
+  // ── Stage 1d: Scoring Agent (2 categories per batch for reliability) ──────
+checkCancelled();
+L(''); L('── Stage 1d: Scoring Agent ───────────────────', 'stage');
+
+const allVendorNames = [...new Set(vendors.map(v => v.name))];
+const capabilities = [];
+// 2 categories per batch instead of 3 — reduces token pressure, fewer parse failures
+const scoreBatches = [];
+for (let i = 0; i < categories.length; i+=2) scoreBatches.push(categories.slice(i, i+2));
+
+for (const batch of scoreBatches) {
   checkCancelled();
-  L(''); L('── Stage 1d: Scoring Agent ───────────────────', 'stage');
+  const bIds = batch.map(c => c.id);
+  L(`  Scoring [${bIds.join(',')}]...`);
+  const bVendors = vendors.filter(v => bIds.includes(v.cat));
 
-  const allVendorNames = [...new Set(vendors.map(v => v.name))];
-  const capabilities = [];
-  const scoreBatches = [];
-  for (let i=0; i<categories.length; i+=3) scoreBatches.push(categories.slice(i,i+3));
-
-  for (const batch of scoreBatches) {
-    checkCancelled();
-    const bIds = batch.map(c => c.id);
-    L(`  Scoring [${bIds.join(',')}]...`);
-    const bVendors = vendors.filter(v => bIds.includes(v.cat));
-    try {
-      const r = await withRetry(async () => withTimeout(
-        client.messages.create({
-          model:MODEL, max_tokens:12000,
-          system:`You are a technology analyst scoring vendor capabilities 0-100. Scale: 90-100=Best-in-Class (only 1 per capability), 75-89=Strong, 60-74=Capable, 45-59=Present, 30-44=Limited, 0=Not applicable. Differentiate clearly — avoid clustering scores. AI-Native vendors should score higher on AI/automation capabilities. Legacy vendors higher on enterprise integrations and compliance. Output ONLY valid JSON.`,
-          messages:[{role:'user',content:`Domain: ${domain}
+  try {
+    const r = await withRetry(async () => withTimeout(
+      client.messages.create({
+        model: MODEL, max_tokens: 12000,
+        system: `You are a technology analyst scoring vendor capabilities 0-100. Scale: 90-100=Best-in-Class (only 1 per capability), 75-89=Strong, 60-74=Capable, 45-59=Present, 30-44=Limited, 0=Not applicable. Differentiate clearly — avoid clustering. AI-Native vendors score higher on AI/automation; Legacy higher on enterprise integrations and compliance. Output ONLY valid JSON.`,
+        messages: [{ role:'user', content:`Domain: ${domain}
 
 Categories to score:
 ${batch.map(c=>`Cat ${c.id} [${c.phase}] ${c.name}\n  Preview caps: ${(c.capabilities_preview||[]).join(', ')}`).join('\n\n')}
@@ -484,21 +486,187 @@ ${bVendors.map(v=>`  [${v.type}] ${v.name} (Cat ${v.cat}): ${(v.desc||'').slice(
 
 ALL vendor names for scores dict: ${allVendorNames.join(', ')}
 
-Define 4-6 capabilities per category. Score ALL vendors in every capability's scores dict (use 0 if not applicable).
-Output: {"capabilities":[{"cat":1,"name":"Specific Capability Name","definition":"One sentence what this does and why it matters.","scores":{"VendorName":85,"Other":0}}]}`}]
+Define EXACTLY 5 capabilities per category. Score ALL vendors in every capability's scores dict (use 0 if not applicable).
+Output: {"capabilities":[{"cat":1,"name":"Specific Capability Name","definition":"One sentence what this does and why it matters.","scores":{"VendorName":85,"Other":0}}]}` }]
+      }),
+      120000, `scoring-${bIds.join(',')}`
+    ), `scoring-${bIds.join(',')}`);
+
+    const d = parseJSON(extractText(r));
+    const newCaps = d.capabilities||[];
+    capabilities.push(...newCaps);
+    L(`  ✓ [${bIds.join(',')}]: ${newCaps.length} capabilities`);
+  } catch(e) {
+    if (e.message === '__CANCELLED__') throw e;
+    L(`  ✗ Scoring [${bIds.join(',')}] failed: ${e.message}`, 'error');
+  }
+}
+L(`  Scored ${capabilities.length} capabilities across ${categories.length} categories`);
+
+// ── Stage 1d Top-up: fill any categories that got 0 capabilities ──────────
+const scoredCatIds = new Set(capabilities.map(c => c.cat));
+const missingCats = categories.filter(c => !scoredCatIds.has(c.id));
+
+if (missingCats.length > 0) {
+  checkCancelled();
+  L(`  ⚠ ${missingCats.length} categories missing capabilities — running top-up...`, 'error');
+
+  for (const cat of missingCats) {
+    checkCancelled();
+    L(`  Top-up scoring: [${cat.phase}]...`);
+    const catVendors = vendors.filter(v => v.cat === cat.id);
+
+    try {
+      const r = await withRetry(async () => withTimeout(
+        client.messages.create({
+          model: MODEL, max_tokens: 8000,
+          system: `You are a technology analyst scoring vendor capabilities 0-100. Output ONLY valid JSON.`,
+          messages: [{ role:'user', content:`Domain: ${domain}
+Category: Cat ${cat.id} [${cat.phase}] ${cat.name}
+Preview capabilities: ${(cat.capabilities_preview||[]).join(', ')}
+
+Vendors: ${catVendors.map(v=>`${v.name} [${v.type}]`).join(', ')}
+ALL vendor names: ${allVendorNames.join(', ')}
+
+Define EXACTLY 5 capabilities for this category. Score ALL vendors (0 if not applicable).
+Output: {"capabilities":[{"cat":${cat.id},"name":"Capability Name","definition":"One sentence definition.","scores":{"VendorName":75}}]}` }]
         }),
-        120000, `scoring-${bIds.join(',')}`
-      ), `scoring-${bIds.join(',')}`);
+        90000, `topup-${cat.phase}`
+      ), `topup-${cat.phase}`);
+
       const d = parseJSON(extractText(r));
-      capabilities.push(...(d.capabilities||[]));
-      L(`  ✓ [${bIds.join(',')}]: ${(d.capabilities||[]).length} capabilities`);
+      const newCaps = d.capabilities||[];
+      capabilities.push(...newCaps);
+      L(`  ✓ Top-up [${cat.phase}]: +${newCaps.length} capabilities`, 'success');
+    } catch(e) {
+      if (e.message === '__CANCELLED__') throw e;
+      L(`  ✗ Top-up [${cat.phase}] failed: ${e.message}`, 'error');
+    }
+    if (missingCats.indexOf(cat) < missingCats.length - 1) await sleep(5000);
+  }
+}
+
+L(`✓ ${capabilities.length} total capabilities scored`, 'success');
+  
+  // ── Stage 1e: Final Quality Pass ──────────────────────────────────────────
+checkCancelled();
+L(''); L('── Stage 1e: Final Quality Pass ──────────────────', 'stage');
+
+// ── 1e-i: Vendor top-up — any category with fewer than 7 vendors ──────────
+const vendorCountByCat = {};
+categories.forEach(c => { vendorCountByCat[c.id] = vendors.filter(v => v.cat===c.id).length; });
+const sparseCategories = categories.filter(c => vendorCountByCat[c.id] < 7);
+
+if (sparseCategories.length > 0) {
+  L(`  ⚠ ${sparseCategories.length} sparse categories (< 7 vendors) — topping up...`, 'error');
+  const vSchemaTopup = `{"vendors":[{"name":"str","type":"Legacy|AI-Native|Analyst","status":"Public|Private|Acquired|Division","ticker":null,"hq":"City, Country","founded":2015,"funding":null,"valuation":null,"round_type":null,"round_amount":null,"round_date":null,"acq_price":null,"acquirer":null,"employees":null,"arr":null,"investors":"","agentic":false,"desc":"2 clear sentences.","products":"Product A","capabilities":"Cap 1; Cap 2"}]}`;
+
+  for (const cat of sparseCategories) {
+    checkCancelled();
+    const have = vendorCountByCat[cat.id];
+    const need = 8 - have;
+    const existingInCat = vendors.filter(v => v.cat===cat.id).map(v => v.name);
+    L(`  Top-up [${cat.phase}]: have ${have}, finding ${need} more...`);
+
+    try {
+      const r = await withRetry(async () => withTimeout(
+        client.messages.create({
+          model: MODEL, max_tokens: 4000,
+          system: `You are a senior technology analyst. Find additional vendors for a market category. Output ONLY valid JSON.`,
+          messages: [{ role:'user', content:`Domain: ${domain}
+Category: [${cat.phase}] ${cat.name}
+Description: ${cat.desc}
+
+Already have these vendors (DO NOT repeat): ${existingInCat.join(', ')}
+
+Find exactly ${need} additional vendors not listed above. Balance Legacy and AI-Native.
+${vSchemaTopup}` }]
+        }),
+        90000, `vendor-topup-${cat.phase}`
+      ), `vendor-topup-${cat.phase}`);
+
+      const d = parseJSON(extractText(r));
+      const newVends = (d.vendors||[])
+        .filter(v => !vendors.find(ev => ev.name.toLowerCase()===v.name.toLowerCase()))
+        .map(v => ({...v, cat:cat.id}));
+      const startId = vendors.length + 1;
+      newVends.forEach((v,i) => { v.id = startId+i; });
+      vendors.push(...newVends);
+      L(`  ✓ [${cat.phase}]: +${newVends.length} vendors (now ${have+newVends.length})`, 'success');
     } catch(e) {
       if (e.message==='__CANCELLED__') throw e;
-      L(`  ✗ Scoring [${bIds.join(',')}] failed: ${e.message}`, 'error');
+      L(`  ✗ Vendor top-up [${cat.phase}] failed: ${e.message}`, 'error');
     }
+    if (sparseCategories.indexOf(cat) < sparseCategories.length-1) await sleep(5000);
   }
-  L(`✓ ${capabilities.length} capabilities scored`, 'success');
+} else {
+  L(`  ✓ All categories have 7+ vendors`, 'success');
+}
 
+// ── 1e-ii: Capability top-up — any category still missing capabilities ─────
+const scoredCatIdsCheck = new Set(capabilities.map(c => c.cat));
+const stillMissingCaps = categories.filter(c => !scoredCatIdsCheck.has(c.id));
+const thinCaps = categories.filter(c => scoredCatIdsCheck.has(c.id) &&
+  capabilities.filter(cap => cap.cat===c.id).length < 3);
+const capsToFix = [...new Set([...stillMissingCaps, ...thinCaps])];
+
+if (capsToFix.length > 0) {
+  L(`  ⚠ ${capsToFix.length} categories need capability top-up...`, 'error');
+  const allVendorNamesCheck = [...new Set(vendors.map(v => v.name))];
+
+  for (const cat of capsToFix) {
+    checkCancelled();
+    const catVendors = vendors.filter(v => v.cat===cat.id);
+    const have = capabilities.filter(c => c.cat===cat.id).length;
+    L(`  Cap top-up [${cat.phase}]: have ${have}, targeting 5...`);
+
+    try {
+      const r = await withRetry(async () => withTimeout(
+        client.messages.create({
+          model: MODEL, max_tokens: 8000,
+          system: `You are a technology analyst scoring vendor capabilities 0-100. Output ONLY valid JSON.`,
+          messages: [{ role:'user', content:`Domain: ${domain}
+Category: Cat ${cat.id} [${cat.phase}] ${cat.name}
+Preview capabilities: ${(cat.capabilities_preview||[]).join(', ')}
+
+Vendors in this category: ${catVendors.map(v=>`${v.name} [${v.type}]`).join(', ')}
+ALL vendor names for scores: ${allVendorNamesCheck.join(', ')}
+
+Define EXACTLY 5 capabilities for this category. Score ALL vendors (0 if not applicable).
+Output: {"capabilities":[{"cat":${cat.id},"name":"Capability Name","definition":"One sentence.","scores":{"VendorName":75}}]}` }]
+        }),
+        90000, `cap-topup-${cat.phase}`
+      ), `cap-topup-${cat.phase}`);
+
+      const d = parseJSON(extractText(r));
+      // Remove any thin existing caps for this category and replace with full set
+      const withoutThin = capabilities.filter(c => c.cat!==cat.id);
+      capabilities.length = 0;
+      capabilities.push(...withoutThin, ...(d.capabilities||[]));
+      L(`  ✓ Cap top-up [${cat.phase}]: now ${capabilities.filter(c=>c.cat===cat.id).length} caps`, 'success');
+    } catch(e) {
+      if (e.message==='__CANCELLED__') throw e;
+      L(`  ✗ Cap top-up [${cat.phase}] failed: ${e.message}`, 'error');
+    }
+    if (capsToFix.indexOf(cat) < capsToFix.length-1) await sleep(5000);
+  }
+} else {
+  L(`  ✓ All categories have sufficient capabilities`, 'success');
+}
+
+// ── 1e-iii: Final counts summary ──────────────────────────────────────────
+const finalVendorCount = vendors.length;
+const finalCapCount = capabilities.length;
+const finalCatCount = categories.length;
+L('');
+L(`  Final counts: ${finalCatCount} categories | ${finalVendorCount} vendors | ${finalCapCount} capabilities`, 'success');
+categories.forEach(c => {
+  const vc = vendors.filter(v=>v.cat===c.id).length;
+  const cc = capabilities.filter(cap=>cap.cat===c.id).length;
+  const flag = (vc < 7 || cc < 3) ? ' ⚠' : ' ✓';
+  L(`    ${flag} [${c.phase}] ${vc} vendors, ${cc} capabilities`);
+});
+  
   // ── Validation ────────────────────────────────────────────────────────────
   L(''); L('── Validation ────────────────────────────────', 'stage');
   const issues = validateResult({ categories, vendors, capabilities });
