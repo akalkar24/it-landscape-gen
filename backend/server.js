@@ -3,13 +3,19 @@
  * Express + SSE for long-running agent jobs
  * Deploy to Railway — no timeout limits
  *
- * FIXES (March 2026):
- *  1. Model updated: claude-sonnet-4-20250514 → claude-sonnet-4-6
- *  2. Web search calls now use wsClient with anthropic-beta header (required for web_search tool)
- *  3. Cancellation guards (checkCancelled) added throughout both pipelines
- *  4. Cancel endpoint now sends __CANCELLED__ signal (not __ERROR__) so frontend can distinguish
- *  5. Library delete route fixed — was broken with dynamic import(fs), now uses top-level unlinkSync
- *  6. All rate-limit sleep delays preserved — they are load-bearing, do not remove
+ * Full rewrite — all fixes consolidated:
+ *  1. Model: claude-sonnet-4-6
+ *  2. wsClient with anthropic-beta header for all web_search calls
+ *  3. withTimeout (Promise.race) on EVERY API call — reliable hang prevention
+ *  4. makeRetry is module-level — both pipelines now have full retry protection
+ *  5. Scoring stage now has withRetry + withTimeout (was unprotected)
+ *  6. Category agent now has withRetry + withTimeout (was unprotected)
+ *  7. refreshPipeline steps all have withRetry + withTimeout (were unprotected)
+ *  8. Cancellation guards throughout both pipelines
+ *  9. Cancel sends __CANCELLED__ signal (not __ERROR__)
+ * 10. Library delete uses top-level unlinkSync
+ * 11. Verification: 1 category per batch to avoid rate limits on web search
+ * 12. Sleeps preserved — load-bearing for TPM management
  */
 import express from 'express';
 import cors from 'cors';
@@ -101,14 +107,12 @@ app.post('/api/job/:id/cancel', (req, res) => {
   job.cancelled = true;
   job.status = 'cancelled';
   log(req.params.id, 'Run cancelled by user', 'error');
-  // FIX: __CANCELLED__ so frontend can distinguish from a real pipeline error
   (sseListeners.get(req.params.id)||[]).forEach(r => {
     try { r.write('data: ' + JSON.stringify({msg:'__CANCELLED__',level:'system'}) + '\n\n'); r.end(); } catch {}
   });
   res.json({ ok:true });
 });
 
-// ── LIBRARY ROUTES ────────────────────────────────────────────────────────────
 app.get('/api/library', (_, res) => res.json(libraryList()));
 
 app.get('/api/library/:id', (req, res) => {
@@ -125,8 +129,6 @@ app.post('/api/library', (req, res) => {
   res.json({ id });
 });
 
-// FIX: was using dynamic import('fs').then(({unlinkSync})=>unlinkSync(fp)) which is buggy
-// Now uses top-level unlinkSync imported at the top
 app.delete('/api/library/:id', (req, res) => {
   const fp = join(LIBRARY_DIR, `${req.params.id}.json`);
   if (!existsSync(fp)) return res.status(404).json({ error:'Not found' });
@@ -166,7 +168,6 @@ app.get('/api/job/:id', (req, res) => {
   res.setHeader('Connection','keep-alive');
   job.logs.forEach(e => res.write(`data: ${JSON.stringify(e)}\n\n`));
   if (job.status !== 'running') {
-    // FIX: replay the right terminal signal when reconnecting to a finished/cancelled job
     const sig = job.status === 'cancelled' ? '__CANCELLED__' : '__DONE__';
     res.write(`data: ${JSON.stringify({msg:sig,level:'system'})}\n\n`);
     return res.end();
@@ -195,20 +196,17 @@ app.post('/api/job/:id/approve', (req, res) => {
   res.json({ ok:true, libraryId: job.libraryId });
 });
 
-// ── DEPLOY TO VERCEL ──────────────────────────────────────────────────────────
 app.post('/api/job/:id/deploy', async (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error:'Not found' });
   if (!['approved','review'].includes(job.status)) return res.status(400).json({ error:'Approve the job first' });
   const vercelToken = req.body.vercelToken || process.env.VERCEL_TOKEN;
-  if (!vercelToken) return res.status(400).json({ error:'Vercel token required. Add to .env or provide in request.' });
+  if (!vercelToken) return res.status(400).json({ error:'Vercel token required.' });
   try {
     const url = await deployToVercel(job.result, job.domain, vercelToken);
     job.status = 'deployed'; job.deployUrl = url;
     res.json({ url });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 async function deployToVercel(landscapeData, domain, token) {
@@ -222,13 +220,13 @@ async function deployToVercel(landscapeData, domain, token) {
     .replace('{{LANDSCAPE_JSON}}', JSON.stringify(landscapeData));
   const htmlB64 = Buffer.from(html, 'utf8').toString('base64');
   const deployResp = await fetch('https://api.vercel.com/v13/deployments', {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+    method:'POST',
+    headers:{ 'Authorization':`Bearer ${token}`, 'Content-Type':'application/json' },
     body: JSON.stringify({
       name: `landscape-${slug}`,
-      files: [{ file: 'index.html', data: htmlB64, encoding: 'base64' }],
+      files: [{ file:'index.html', data:htmlB64, encoding:'base64' }],
       target: 'production',
-      projectSettings: { framework: null, buildCommand: null, outputDirectory: null, installCommand: null, devCommand: null }
+      projectSettings: { framework:null, buildCommand:null, outputDirectory:null, installCommand:null, devCommand:null }
     })
   });
   const deployData = await deployResp.json();
@@ -236,10 +234,9 @@ async function deployToVercel(landscapeData, domain, token) {
   const deployId = deployData.id;
   for (let i = 0; i < 30; i++) {
     await new Promise(r => setTimeout(r, 3000));
-    const statusResp = await fetch(`https://api.vercel.com/v13/deployments/${deployId}`, { headers:{'Authorization':`Bearer ${token}`} });
-    const statusData = await statusResp.json();
-    if (statusData.readyState === 'READY') return `https://${statusData.url}`;
-    if (statusData.readyState === 'ERROR') throw new Error('Vercel deployment failed');
+    const s = await fetch(`https://api.vercel.com/v13/deployments/${deployId}`, { headers:{'Authorization':`Bearer ${token}`} }).then(r=>r.json());
+    if (s.readyState === 'READY') return `https://${s.url}`;
+    if (s.readyState === 'ERROR') throw new Error('Vercel deployment failed');
   }
   return `https://landscape-${slug}.vercel.app`;
 }
@@ -259,6 +256,48 @@ function parseJSON(text) {
 
 const sleep = ms => new Promise(res => setTimeout(res, ms));
 
+// ── TIMEOUT WRAPPER ───────────────────────────────────────────────────────────
+// Promise.race — fires regardless of SDK version or Railway connection behaviour.
+// This is the primary hang prevention mechanism. The SDK timeout= is a secondary
+// backstop only. Do NOT remove this in favour of SDK timeout alone — it has proven
+// unreliable on Railway (calls hung for 30+ minutes with SDK timeout set).
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`TIMEOUT:${label} after ${ms/1000}s`)), ms)
+    )
+  ]);
+}
+
+// ── RETRY FACTORY (module-level so BOTH pipelines use it) ────────────────────
+// Returns a withRetry function bound to a job's log and cancel check.
+// Handles 429 rate limits (exponential backoff) and timeouts (flat 20s retry).
+// Backoff schedule: 30s, 60s, 120s, 240s — load-bearing, do not reduce.
+function makeRetry(logFn, cancelFn) {
+  return async function withRetry(fn, label, maxRetries=4) {
+    for (let attempt=0; attempt<=maxRetries; attempt++) {
+      cancelFn();
+      try {
+        return await fn();
+      } catch(e) {
+        if (e.message === '__CANCELLED__') throw e;
+        const is429     = e.status===429 || (e.message||'').includes('rate_limit');
+        const isTimeout = (e.message||'').startsWith('TIMEOUT:') ||
+                          (e.message||'').toLowerCase().includes('timeout') ||
+                          e.code==='ETIMEDOUT';
+        if ((is429||isTimeout) && attempt<maxRetries) {
+          const wait = is429 ? Math.pow(2, attempt+1)*15000 : 20000;
+          logFn(`  [${label}] ${is429?'Rate limit':'Timeout'} — waiting ${wait/1000}s, retry ${attempt+1}/${maxRetries}...`, 'error');
+          await sleep(wait);
+        } else {
+          throw e;
+        }
+      }
+    }
+  };
+}
+
 const CAT_COLORS = [
   ['#3B82F6','rgba(59,130,246,0.1)'],['#8B5CF6','rgba(139,92,246,0.1)'],
   ['#0D9488','rgba(13,148,136,0.1)'],['#D97706','rgba(217,119,6,0.1)'],
@@ -267,14 +306,13 @@ const CAT_COLORS = [
   ['#059669','rgba(5,150,105,0.1)'],['#BE185D','rgba(190,24,93,0.1)'],
 ];
 
-// ── VALIDATION PASS ───────────────────────────────────────────────────────────
 function validateResult(result) {
   const issues = [];
   const { categories=[], vendors=[], capabilities=[] } = result;
   if (categories.length < 7) issues.push(`Only ${categories.length} categories (min 7)`);
-  if (vendors.length < 40) issues.push(`Only ${vendors.length} vendors (min 40)`);
+  if (vendors.length < 40)   issues.push(`Only ${vendors.length} vendors (min 40)`);
   if (capabilities.length < 20) issues.push(`Only ${capabilities.length} capabilities (min 20)`);
-  const orphans = vendors.filter(v => !categories.find(c => c.id === v.cat));
+  const orphans = vendors.filter(v => !categories.find(c => c.id===v.cat));
   if (orphans.length) issues.push(`${orphans.length} vendors with invalid category ID`);
   let badScores = 0;
   capabilities.forEach(cap => Object.values(cap.scores||{}).forEach(s => { if(s<0||s>100) badScores++; }));
@@ -284,70 +322,54 @@ function validateResult(result) {
 
 // ── BUILD PIPELINE ────────────────────────────────────────────────────────────
 async function buildPipeline(jobId, domain, brief, persona, apiKey) {
-  // FIX 1: Updated model string
   const MODEL = 'claude-sonnet-4-6';
 
-  // FIX 2: Two clients — standard for non-search calls, wsClient for web_search tool calls
-  // The web_search tool requires the 'anthropic-beta: web-search-2025-03-05' header
-  const client   = new Anthropic({ apiKey, timeout: 90000 });
-  const wsClient = new Anthropic({ apiKey, timeout: 120000, defaultHeaders: { 'anthropic-beta': 'web-search-2025-03-05' } });
-  
-  const L = (m,lv='info') => log(jobId,m,lv);
+  // SDK timeout is a secondary backstop — withTimeout (Promise.race) is primary
+  const client   = new Anthropic({ apiKey, timeout:100000 });
+  const wsClient = new Anthropic({ apiKey, timeout:130000, defaultHeaders:{ 'anthropic-beta':'web-search-2025-03-05' } });
 
-  // FIX 3: Cancellation guard — throws so all awaits unwind immediately when user hits Stop
-  const checkCancelled = () => {
-    if (jobs.get(jobId)?.cancelled) throw new Error('__CANCELLED__');
-  };
+  const L  = (m,lv='info') => log(jobId,m,lv);
+  const checkCancelled = () => { if (jobs.get(jobId)?.cancelled) throw new Error('__CANCELLED__'); };
+  const withRetry = makeRetry(L, checkCancelled);
 
   L(`New landscape: ${domain} | Persona: ${persona}`);
 
   // ── Stage 1a: Category Agent ──────────────────────────────────────────────
   checkCancelled();
   L(''); L('── Stage 1a: Category Agent ──────────────────', 'stage');
-  const catResp = await client.messages.create({
-    model: MODEL, max_tokens:3000,
-    system:`You are a senior technology analyst. Build a MECE value-chain taxonomy of 8-10 categories for the given technology domain from your training knowledge. Categories flow left to right: discovery/awareness → execution → optimization/renewal. Market sizes from Gartner/IDC/MarketsandMarkets. Phase labels are short ALL CAPS verbs (DISCOVER, MAP, GOVERN, OPTIMIZE, RENEW etc). Output ONLY valid JSON, no preamble.`,
-    messages:[{role:'user',content:`Domain: ${domain}\nPersona: ${persona}\nBrief:\n${brief}\n\nOutput: {"categories":[{"id":1,"phase":"VERB","name":"Full Name","short":"Short (2-3 words)","market":"$XB","cagr":"X%","desc":"2-3 sentence description of what this category does and why it matters to the buyer.","capabilities_preview":["5 specific capability names"],"gartner":"Official Gartner segment name"}]}`}]
-  });
-  const catData = parseJSON(extractText(catResp));
+
+  const catData = await withRetry(async () => {
+    const r = await withTimeout(
+      client.messages.create({
+        model:MODEL, max_tokens:3000,
+        system:`You are a senior technology analyst. Build a MECE value-chain taxonomy of 8-10 categories for the given technology domain from your training knowledge. Categories flow left to right: discovery/awareness → execution → optimization/renewal. Market sizes from Gartner/IDC/MarketsandMarkets. Phase labels are short ALL CAPS verbs (DISCOVER, MAP, GOVERN, OPTIMIZE, RENEW etc). Output ONLY valid JSON, no preamble.`,
+        messages:[{role:'user',content:`Domain: ${domain}\nPersona: ${persona}\nBrief:\n${brief}\n\nOutput: {"categories":[{"id":1,"phase":"VERB","name":"Full Name","short":"Short (2-3 words)","market":"$XB","cagr":"X%","desc":"2-3 sentence description of what this category does and why it matters to the buyer.","capabilities_preview":["5 specific capability names"],"gartner":"Official Gartner segment name"}]}`}]
+      }),
+      90000, 'categories'
+    );
+    return parseJSON(extractText(r));
+  }, 'categories');
+
   const categories = catData.categories.map((c,i) => ({...c, id:i+1, color:CAT_COLORS[i%10][0], dim:CAT_COLORS[i%10][1]}));
   L(`✓ ${categories.length} categories`, 'success');
 
-  // ── Stage 1b: Vendor Agent (sequential, 5s gap between categories) ────────
+  // ── Stage 1b: Vendor Agent (sequential, 5s gap) ───────────────────────────
   checkCancelled();
-  L(''); L(`── Stage 1b: Vendor Agent (sequential) ──`, 'stage');
-  const vSchema = `{"vendors":[{"name":"str","type":"Legacy|AI-Native|Analyst","status":"Public|Private|Acquired|Division","ticker":"str|null","hq":"City, Country","founded":2015,"funding":150,"valuation":null,"round_type":"Series B|null","round_amount":50,"round_date":"Jan 2024|null","acq_price":null,"acquirer":null,"employees":500,"arr":80,"investors":"VC Names","agentic":true,"desc":"2 clear sentences. What it does and why buyers buy it.","products":"Product A, Product B, Product C","capabilities":"Cap 1; Cap 2; Cap 3; Cap 4"}]}`;
+  L(''); L('── Stage 1b: Vendor Agent (sequential) ──', 'stage');
 
-  // Retry with exponential backoff — delays are load-bearing for TPM management
-  async function withRetry(fn, label, maxRetries = 4) {
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
-      checkCancelled();
-      try {
-        return await fn();
-      } catch(e) {
-        if (e.message === '__CANCELLED__') throw e;
-        const is429 = e.status === 429 || (e.message||'').includes('rate_limit');
-        const isTimeout = (e.message||'').toLowerCase().includes('timeout') || e.code === 'ETIMEDOUT' || e.name === 'APIConnectionTimeoutError';
-        if ((is429 || isTimeout) && attempt < maxRetries) {
-        const wait = is429 ? Math.pow(2, attempt + 1) * 15000 : 20000; // timeouts retry after flat 20s
-    
-          L(`  [${label}] Rate limit hit — waiting ${wait/1000}s before retry ${attempt+1}/${maxRetries}...`, 'error');
-          await sleep(wait);
-        } else {
-          throw e;
-        }
-      }
-    }
-  }
+  const vSchema = `{"vendors":[{"name":"str","type":"Legacy|AI-Native|Analyst","status":"Public|Private|Acquired|Division","ticker":"str|null","hq":"City, Country","founded":2015,"funding":150,"valuation":null,"round_type":"Series B|null","round_amount":50,"round_date":"Jan 2024|null","acq_price":null,"acquirer":null,"employees":500,"arr":80,"investors":"VC Names","agentic":true,"desc":"2 clear sentences. What it does and why buyers buy it.","products":"Product A, Product B, Product C","capabilities":"Cap 1; Cap 2; Cap 3; Cap 4"}]}`;
 
   async function fetchVendorsForCat(cat) {
     L(`  [${cat.phase}] Discovering vendors...`);
     return withRetry(async () => {
-      const r = await client.messages.create({
-        model: MODEL, max_tokens:6000,
-        system:`You are a senior technology analyst. Profile 8-12 vendors for this market category from your training knowledge. For public companies include known revenue/ARR. For private companies use last known funding round. Set unknown financials to null — null is better than a wrong number. Legacy=founded pre-2016 or traditional SaaS; AI-Native=LLM/ML-first product, founded post-2018 with AI core; Analyst=research/advisory firm. Output ONLY valid JSON.`,
-        messages:[{role:'user',content:`Domain: ${domain}\nCategory: ${cat.name} [${cat.phase} phase]\nDescription: ${cat.desc}\nKey capabilities: ${(cat.capabilities_preview||[]).join(', ')}\nBuyer: ${persona}\n\nFind 8-12 vendors. Balance ~50% Legacy, ~45% AI-Native, ~5% Analyst.\n\n${vSchema}`}]
-      });
+      const r = await withTimeout(
+        client.messages.create({
+          model:MODEL, max_tokens:6000,
+          system:`You are a senior technology analyst. Profile 8-12 vendors for this market category from your training knowledge. For public companies include known revenue/ARR. For private companies use last known funding round. Set unknown financials to null — null is better than a wrong number. Legacy=founded pre-2016 or traditional SaaS; AI-Native=LLM/ML-first product, founded post-2018 with AI core; Analyst=research/advisory firm. Output ONLY valid JSON.`,
+          messages:[{role:'user',content:`Domain: ${domain}\nCategory: ${cat.name} [${cat.phase} phase]\nDescription: ${cat.desc}\nKey capabilities: ${(cat.capabilities_preview||[]).join(', ')}\nBuyer: ${persona}\n\nFind 8-12 vendors. Balance ~50% Legacy, ~45% AI-Native, ~5% Analyst.\n\n${vSchema}`}]
+        }),
+        90000, cat.phase
+      );
       const d = parseJSON(extractText(r));
       const vends = (d.vendors||[]).map(v => ({...v, cat:cat.id}));
       L(`  [${cat.phase}] ✓ ${vends.length} vendors`);
@@ -356,101 +378,101 @@ async function buildPipeline(jobId, domain, brief, persona, apiKey) {
   }
 
   const vendors = [];
-  for (let i = 0; i < categories.length; i++) {
+  for (let i=0; i<categories.length; i++) {
     checkCancelled();
-    const cat = categories[i];
     try {
-      const vends = await fetchVendorsForCat(cat);
-      vendors.push(...vends);
+      vendors.push(...await fetchVendorsForCat(categories[i]));
     } catch(e) {
-      if (e.message === '__CANCELLED__') throw e;
-      L(`  [${cat.phase}] ✗ Failed after retries: ${e.message}`, 'error');
+      if (e.message==='__CANCELLED__') throw e;
+      L(`  [${categories[i].phase}] ✗ Failed: ${e.message}`, 'error');
     }
-    // 5s gap between category calls — keeps well under TPM limits (load-bearing, do not remove)
-    if (i < categories.length - 1) await sleep(5000);
+    if (i < categories.length-1) await sleep(5000); // load-bearing TPM gap
   }
   vendors.forEach((v,i) => { v.id=i+1; });
   L(`✓ ${vendors.length} total vendors`, 'success');
 
-  // ── Stage 1c: Verification Agent (web search gap-check) ───────────────────
+  // ── Stage 1c: Verification (1 category per batch to avoid web search rate limits) ──
   checkCancelled();
   L(''); L('── Stage 1c: Verification Agent (web search gap-check) ──', 'stage');
-  L(`  Checking for missing vendors — especially recent AI-native startups...`);
-  // 15s buffer to let TPM window clear before web search (load-bearing — do not remove)
-  await sleep(15000);
+  L('  Checking for missing vendors — especially recent AI-native startups...');
+  await sleep(15000); // TPM buffer before web search — load-bearing
 
   const verifySchema = `{"new_vendors":[{"name":"str","type":"AI-Native|Legacy","status":"Private|Public","hq":"City, Country","founded":2020,"funding":30,"valuation":null,"round_type":"Series A|null","round_amount":30,"round_date":"Jan 2025|null","acq_price":null,"acquirer":null,"employees":80,"arr":null,"investors":"VC Names","agentic":true,"cat":1,"desc":"2 sentences.","products":"Product A, B","capabilities":"Cap 1; Cap 2"}]}`;
 
-  const catBatchesV = [];
-  for(let i=0; i<categories.length; i+=1) catBatchesV.push(categories.slice(i,i+1));
   const verifiedNewVendors = [];
   const existingNames = new Set(vendors.map(v => v.name.toLowerCase()));
 
-  for(let bi=0; bi<catBatchesV.length; bi++) {
+  for (let bi=0; bi<categories.length; bi++) {
     checkCancelled();
-    const batch = catBatchesV[bi];
-    L(`  Verifying batch ${bi+1}/${catBatchesV.length}: [${batch.map(c=>c.phase).join(', ')}]`);
-    const existingInBatch = vendors.filter(v => batch.some(c => c.id === v.cat)).map(v => v.name);
-    try {
-      // FIX: use wsClient — web_search tool requires the anthropic-beta header
-      const rv = await withRetry(async () => wsClient.messages.create({
-        model: MODEL, max_tokens:4000,
-        system:`You are a technology analyst finding gaps in a vendor landscape. Find notable vendors MISSED in the initial pass — especially recently funded AI-native startups (last 18 months), niche specialists, recently acquired companies. Only return vendors you can verify exist via web search. Output ONLY valid JSON.`,
-        tools:[{type:'web_search_20250305',name:'web_search'}],
-        messages:[{role:'user',content:`Domain: ${domain}
-Categories: ${batch.map(c=>`[${c.phase}] ${c.name}`).join(' | ')}
+    const cat = categories[bi];
+    L(`  Verifying ${bi+1}/${categories.length}: [${cat.phase}]`);
+    const existingInCat = vendors.filter(v => v.cat===cat.id).map(v => v.name);
 
-Already in landscape (DO NOT repeat): ${existingInBatch.join(', ')}
+    try {
+      const rv = await withRetry(async () => withTimeout(
+        wsClient.messages.create({
+          model:MODEL, max_tokens:4000,
+          system:`You are a technology analyst finding gaps in a vendor landscape. Find notable vendors MISSED in the initial pass — especially recently funded AI-native startups (last 18 months), niche specialists, recently acquired companies. Only return vendors you can verify exist via web search. Output ONLY valid JSON.`,
+          tools:[{type:'web_search_20250305',name:'web_search'}],
+          messages:[{role:'user',content:`Domain: ${domain}
+Category: [${cat.phase}] ${cat.name}
+
+Already in landscape for this category (DO NOT repeat): ${existingInCat.join(', ')}
 
 Search for:
-1. AI-native startups in these categories that raised funding in last 18 months
-2. Market leaders or frequently cited vendors missing from above list
+1. AI-native startups in this category that raised funding in last 18 months
+2. Market leaders or frequently cited vendors missing from the list
 3. Recently acquired companies notable in this space
 
-Return 2-5 genuinely new vendors NOT already listed. Assign each to the most relevant cat ID (${batch.map(c=>`${c.id}=${c.phase}`).join(', ')}).
+Return 2-5 genuinely new vendors NOT already listed. Use cat ID: ${cat.id}
 
 ${verifySchema}`}]
-      }), `verify-${bi+1}`);
+        }),
+        120000, `verify-${bi+1}`
+      ), `verify-${bi+1}`);
 
       const dv = parseJSON(extractText(rv));
       const newOnes = (dv.new_vendors||[]).filter(v => !existingNames.has(v.name.toLowerCase()));
       newOnes.forEach(v => existingNames.add(v.name.toLowerCase()));
       verifiedNewVendors.push(...newOnes);
-      L(`  ✓ Batch ${bi+1}: +${newOnes.length} new vendors`, 'success');
+      L(`  ✓ ${bi+1}/${categories.length}: +${newOnes.length} new vendors`, 'success');
     } catch(e) {
-      if (e.message === '__CANCELLED__') throw e;
-      L(`  ✗ Verify batch ${bi+1} failed: ${e.message}`, 'error');
+      if (e.message==='__CANCELLED__') throw e;
+      L(`  ✗ Verify ${bi+1} failed: ${e.message}`, 'error');
     }
-    // 30s between verification batches — web search is heavy on TPM (load-bearing)
-    if(bi < catBatchesV.length - 1) await sleep(30000);
+    // 30s between web search calls — load-bearing, do not reduce
+    if (bi < categories.length-1) await sleep(30000);
   }
 
-  if(verifiedNewVendors.length > 0) {
-    const startId = vendors.length + 1;
-    verifiedNewVendors.forEach((v,i) => { v.id = startId + i; });
+  if (verifiedNewVendors.length > 0) {
+    const startId = vendors.length+1;
+    verifiedNewVendors.forEach((v,i) => { v.id=startId+i; });
     vendors.push(...verifiedNewVendors);
     L(`✓ Verification complete — +${verifiedNewVendors.length} added (${vendors.length} total)`, 'success');
   } else {
-    L(`✓ Verification complete — no gaps found`, 'success');
+    L('✓ Verification complete — no gaps found', 'success');
   }
 
-  // ── Stage 1d: Scoring Agent (batched, 3 categories at a time) ─────────────
+  // ── Stage 1d: Scoring (3 categories per batch) ────────────────────────────
   checkCancelled();
   L(''); L('── Stage 1d: Scoring Agent ───────────────────', 'stage');
-  const allVendorNames = [...new Set(vendors.map(v=>v.name))];
+
+  const allVendorNames = [...new Set(vendors.map(v => v.name))];
   const capabilities = [];
   const scoreBatches = [];
-  for(let i=0; i<categories.length; i+=3) scoreBatches.push(categories.slice(i,i+3));
+  for (let i=0; i<categories.length; i+=3) scoreBatches.push(categories.slice(i,i+3));
 
-  for(const batch of scoreBatches) {
+  for (const batch of scoreBatches) {
     checkCancelled();
-    const bIds = batch.map(c=>c.id);
+    const bIds = batch.map(c => c.id);
     L(`  Scoring [${bIds.join(',')}]...`);
-    const bVendors = vendors.filter(v=>bIds.includes(v.cat));
-    const r = await client.messages.create({
-      model: MODEL, max_tokens:12000,
-      system:`You are a technology analyst scoring vendor capabilities 0-100. Scale: 90-100=Best-in-Class (only 1 per capability), 75-89=Strong, 60-74=Capable, 45-59=Present, 30-44=Limited, 0=Not applicable. Differentiate clearly — avoid clustering scores in the 60-75 band. AI-Native vendors should score higher on AI/automation capabilities. Legacy vendors should score higher on enterprise integrations and compliance. Output ONLY valid JSON.`,
-      messages:[{role:'user',content:`Domain: ${domain}
+    const bVendors = vendors.filter(v => bIds.includes(v.cat));
+    try {
+      const r = await withRetry(async () => withTimeout(
+        client.messages.create({
+          model:MODEL, max_tokens:12000,
+          system:`You are a technology analyst scoring vendor capabilities 0-100. Scale: 90-100=Best-in-Class (only 1 per capability), 75-89=Strong, 60-74=Capable, 45-59=Present, 30-44=Limited, 0=Not applicable. Differentiate clearly — avoid clustering scores. AI-Native vendors should score higher on AI/automation capabilities. Legacy vendors higher on enterprise integrations and compliance. Output ONLY valid JSON.`,
+          messages:[{role:'user',content:`Domain: ${domain}
 
 Categories to score:
 ${batch.map(c=>`Cat ${c.id} [${c.phase}] ${c.name}\n  Preview caps: ${(c.capabilities_preview||[]).join(', ')}`).join('\n\n')}
@@ -462,12 +484,16 @@ ALL vendor names for scores dict: ${allVendorNames.join(', ')}
 
 Define 4-6 capabilities per category. Score ALL vendors in every capability's scores dict (use 0 if not applicable).
 Output: {"capabilities":[{"cat":1,"name":"Specific Capability Name","definition":"One sentence what this does and why it matters.","scores":{"VendorName":85,"Other":0}}]}`}]
-    });
-    try {
+        }),
+        120000, `scoring-${bIds.join(',')}`
+      ), `scoring-${bIds.join(',')}`);
       const d = parseJSON(extractText(r));
       capabilities.push(...(d.capabilities||[]));
       L(`  ✓ [${bIds.join(',')}]: ${(d.capabilities||[]).length} capabilities`);
-    } catch(e) { L(`  ✗ Scoring parse error: ${e.message}`, 'error'); }
+    } catch(e) {
+      if (e.message==='__CANCELLED__') throw e;
+      L(`  ✗ Scoring [${bIds.join(',')}] failed: ${e.message}`, 'error');
+    }
   }
   L(`✓ ${capabilities.length} capabilities scored`, 'success');
 
@@ -488,12 +514,12 @@ Output: {"capabilities":[{"cat":1,"name":"Specific Capability Name","definition"
 async function refreshPipeline(jobId, domain, existingData, brief, persona, apiKey) {
   const MODEL = 'claude-sonnet-4-6';
 
-  // FIX: two clients — wsClient for web_search calls, client for everything else
-  const client   = new Anthropic({ apiKey, timeout: 90000 });
-  const wsClient = new Anthropic({ apiKey, timeout: 120000, defaultHeaders: { 'anthropic-beta': 'web-search-2025-03-05' } });
-  
+  const client   = new Anthropic({ apiKey, timeout:100000 });
+  const wsClient = new Anthropic({ apiKey, timeout:130000, defaultHeaders:{ 'anthropic-beta':'web-search-2025-03-05' } });
+
   const L = (m,lv='info') => log(jobId,m,lv);
   const checkCancelled = () => { if (jobs.get(jobId)?.cancelled) throw new Error('__CANCELLED__'); };
+  const withRetry = makeRetry(L, checkCancelled);
 
   const { categories, vendors, capabilities } = existingData;
   L(`Refreshing: ${domain} | ${vendors.length} existing vendors`);
@@ -501,67 +527,85 @@ async function refreshPipeline(jobId, domain, existingData, brief, persona, apiK
   // Step 1 — Staleness check
   checkCancelled();
   L(''); L('── Step 1: Staleness Check ───────────────────', 'stage');
-  // FIX: use wsClient for web_search tool
-  const staleResp = await wsClient.messages.create({
-    model: MODEL, max_tokens:5000,
-    system:`Check for vendor status changes since mid-2024. Search for acquisitions, IPOs, shutdowns, major funding rounds. Output ONLY valid JSON.`,
-    tools:[{type:'web_search_20250305',name:'web_search'}],
-    messages:[{role:'user',content:`Check these ${domain} vendors for recent changes:\n${vendors.map(v=>v.name).join(', ')}\n\nOutput: {"changes":[{"name":"VendorName","change_type":"acquired|ipo|shutdown|funding","description":"Brief description of change","new_status":"Public|Private|Acquired","new_funding":150,"acquirer":"Name or null","acq_price":500}]}\n\nOnly include vendors with confirmed, verifiable changes.`}]
-  });
   let changes = [];
-  try { changes = parseJSON(extractText(staleResp)).changes||[]; } catch {}
+  try {
+    const r = await withRetry(async () => withTimeout(
+      wsClient.messages.create({
+        model:MODEL, max_tokens:5000,
+        system:`Check for vendor status changes since mid-2024. Search for acquisitions, IPOs, shutdowns, major funding rounds. Output ONLY valid JSON.`,
+        tools:[{type:'web_search_20250305',name:'web_search'}],
+        messages:[{role:'user',content:`Check these ${domain} vendors for recent changes:\n${vendors.map(v=>v.name).join(', ')}\n\nOutput: {"changes":[{"name":"VendorName","change_type":"acquired|ipo|shutdown|funding","description":"Brief description","new_status":"Public|Private|Acquired","new_funding":150,"acquirer":"Name or null","acq_price":500}]}\n\nOnly include vendors with confirmed, verifiable changes.`}]
+      }),
+      120000, 'staleness'
+    ), 'staleness');
+    changes = parseJSON(extractText(r)).changes||[];
+  } catch(e) {
+    if (e.message==='__CANCELLED__') throw e;
+    L(`  ✗ Staleness check failed: ${e.message}`, 'error');
+  }
   changes.forEach(c => L(`  ↻ ${c.name}: ${c.change_type} — ${c.description}`));
   L(`✓ ${changes.length} status changes found`, 'success');
 
   // Step 2 — New vendor discovery
   checkCancelled();
   L(''); L('── Step 2: New Vendor Discovery ─────────────', 'stage');
-  const existingNames = new Set(vendors.map(v=>v.name.toLowerCase()));
-  // FIX: use wsClient
-  const newVendorResp = await wsClient.messages.create({
-    model: MODEL, max_tokens:8000,
-    system:`Find new AI-native startups and recently-funded vendors not yet in the landscape. Focus on last 12 months. Verify each via web search. Output ONLY valid JSON.`,
-    tools:[{type:'web_search_20250305',name:'web_search'}],
-    messages:[{role:'user',content:`Domain: ${domain}\nCategories: ${categories.map(c=>c.name).join(', ')}\n${brief?`Context: ${brief.slice(0,300)}`:''}
+  const existingNames = new Set(vendors.map(v => v.name.toLowerCase()));
+  let newVendors = [];
+  try {
+    const r = await withRetry(async () => withTimeout(
+      wsClient.messages.create({
+        model:MODEL, max_tokens:8000,
+        system:`Find new AI-native startups and recently-funded vendors not yet in the landscape. Focus on last 12 months. Verify each via web search. Output ONLY valid JSON.`,
+        tools:[{type:'web_search_20250305',name:'web_search'}],
+        messages:[{role:'user',content:`Domain: ${domain}\nCategories: ${categories.map(c=>c.name).join(', ')}\n${brief?`Context: ${brief.slice(0,300)}`:''}
 
 Already in landscape (DO NOT include): ${[...existingNames].slice(0,50).join(', ')}
 
 Find 5-20 genuinely new vendors. Search for: "${domain} startups 2025", "${domain} funding 2025", new players in each category.
 
-Output: {"vendors":[{"name":"str","type":"AI-Native|Legacy","status":"Private","hq":"City","founded":2023,"funding":20,"valuation":null,"round_type":"Series A","round_amount":20,"round_date":"Jun 2025","acq_price":null,"acquirer":null,"employees":40,"arr":null,"investors":"VCNames","agentic":true,"cat":1,"desc":"2 sentences. What it does and why buyers care.","products":"Product A","capabilities":"Cap 1; Cap 2"}]}`}]
-  });
-  let newVendors = [];
-  try {
-    const d = parseJSON(extractText(newVendorResp));
-    newVendors = (d.vendors||[]).filter(v=>!existingNames.has(v.name.toLowerCase()));
-  } catch {}
+Output: {"vendors":[{"name":"str","type":"AI-Native|Legacy","status":"Private","hq":"City","founded":2023,"funding":20,"valuation":null,"round_type":"Series A","round_amount":20,"round_date":"Jun 2025","acq_price":null,"acquirer":null,"employees":40,"arr":null,"investors":"VCNames","agentic":true,"cat":1,"desc":"2 sentences.","products":"Product A","capabilities":"Cap 1; Cap 2"}]}`}]
+      }),
+      120000, 'new-vendors'
+    ), 'new-vendors');
+    const d = parseJSON(extractText(r));
+    newVendors = (d.vendors||[]).filter(v => !existingNames.has(v.name.toLowerCase()));
+  } catch(e) {
+    if (e.message==='__CANCELLED__') throw e;
+    L(`  ✗ New vendor discovery failed: ${e.message}`, 'error');
+  }
   newVendors.forEach(v => L(`  + ${v.name} [${v.type}] → Cat ${v.cat}`));
   L(`✓ ${newVendors.length} new vendors found`, 'success');
 
-  // Step 3 — Score new vendors (only if any were found)
+  // Step 3 — Score new vendors
   let updatedCaps = capabilities;
   if (newVendors.length > 0) {
     checkCancelled();
     L(''); L('── Step 3: Scoring New Vendors ───────────────', 'stage');
-    const scoreResp = await client.messages.create({
-      model: MODEL, max_tokens:6000,
-      system:`Score new vendors 0-100 on existing capability dimensions. Use the same scale: 90+=Best-in-Class, 75-89=Strong, 60-74=Capable, 45-59=Present, 30-44=Limited, 0=N/A. Output ONLY valid JSON.`,
-      messages:[{role:'user',content:`New vendors:\n${newVendors.map(v=>`${v.name} [${v.type}] Cat${v.cat}: ${v.desc}`).join('\n')}\n\nExisting capabilities:\n${capabilities.map(c=>`Cat${c.cat} "${c.name}": ${c.definition||''}`).join('\n')}\n\nOutput: {"scores":[{"vendor":"Name","capability":"Exact cap name","score":75}]}`}]
-    });
     try {
-      const d = parseJSON(extractText(scoreResp));
+      const r = await withRetry(async () => withTimeout(
+        client.messages.create({
+          model:MODEL, max_tokens:6000,
+          system:`Score new vendors 0-100 on existing capability dimensions. Scale: 90+=Best-in-Class, 75-89=Strong, 60-74=Capable, 45-59=Present, 30-44=Limited, 0=N/A. Output ONLY valid JSON.`,
+          messages:[{role:'user',content:`New vendors:\n${newVendors.map(v=>`${v.name} [${v.type}] Cat${v.cat}: ${v.desc}`).join('\n')}\n\nExisting capabilities:\n${capabilities.map(c=>`Cat${c.cat} "${c.name}": ${c.definition||''}`).join('\n')}\n\nOutput: {"scores":[{"vendor":"Name","capability":"Exact cap name","score":75}]}`}]
+        }),
+        90000, 'scoring'
+      ), 'scoring');
+      const d = parseJSON(extractText(r));
       updatedCaps = capabilities.map(cap => {
         const newScores = {...cap.scores};
         (d.scores||[]).filter(s=>s.capability===cap.name).forEach(s=>{ newScores[s.vendor]=s.score; });
         return {...cap, scores:newScores};
       });
       L(`✓ Scored ${newVendors.length} new vendors`, 'success');
-    } catch(e) { L(`  Warning: score parse: ${e.message}`, 'error'); }
+    } catch(e) {
+      if (e.message==='__CANCELLED__') throw e;
+      L(`  ✗ Scoring failed: ${e.message}`, 'error');
+    }
   }
 
-  // Apply staleness updates to existing vendors
+  // Apply staleness updates
   const updatedVendors = vendors.map(v => {
-    const c = changes.find(ch=>ch.name.toLowerCase()===v.name.toLowerCase());
+    const c = changes.find(ch => ch.name.toLowerCase()===v.name.toLowerCase());
     if (!c) return v;
     return {...v, status:c.new_status||v.status, funding:c.new_funding||v.funding, acquirer:c.acquirer||v.acquirer, acq_price:c.acq_price||v.acq_price};
   });
