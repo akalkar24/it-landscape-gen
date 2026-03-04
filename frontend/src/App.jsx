@@ -251,23 +251,15 @@ export default function App() {
 
   // Poll for result
   useEffect(() => {
-  if (!jobId || view !== "running") return;
-  const poll = setInterval(async () => {
-  try {
-    const d = await fetch(`${API}/api/job/${jobId}/result`).then(r=>r.json());
-  if (d.status === 'review') {
-  setResult(d.result); setJobStatus('review'); setView('review'); clearInterval(poll);
-  } else if (d.status === 'error') {
-  setError(d.error || 'Pipeline failed — check logs for details');
-  setView('home');
-  clearInterval(poll);
-  } else if (d.status === 'cancelled') {
-  // User hit Stop — cancelJob() already reset view, just stop polling
-  clearInterval(poll);
-  }
-  } catch {}
-  }, 3000);
-  return () => clearInterval(poll);
+    if (!jobId || view !== "running") return;
+    const poll = setInterval(async () => {
+      try {
+        const d = await fetch(`${API}/api/job/${jobId}/result`).then(r=>r.json());
+        if (d.status === 'review') { setResult(d.result); setJobStatus('review'); setView('review'); clearInterval(poll); }
+        else if (d.status === 'error') { setError(d.error); clearInterval(poll); }
+      } catch {}
+    }, 3000);
+    return () => clearInterval(poll);
   }, [jobId, view]);
 
   // Load library when switching to refresh mode
@@ -396,27 +388,11 @@ export default function App() {
       setJobId(d.jobId); setStartedAt(Date.now()); setElapsed(0); setView('running');
       const es = new EventSource(`${API}/api/job/${d.jobId}`);
       es.onmessage = e => {
-      const entry = JSON.parse(e.data);
-      if (entry.msg === '__DONE__') {
-        es.close();
-        return;
-      }
-        if (entry.msg === '__ERROR__') {
-  es.close();
-  // Stay on running view so the user can actually read the log
-  setError('Pipeline failed — see log above for the specific error');
-  return;
-}
-     
-      if (entry.msg === '__CANCELLED__') {
-        // cancelJob() already handles view transition, just close the stream
-        es.close();
-        return;
-      }
-      setLogs(prev => [...prev, entry]);
-    };
-    es.onerror = () => { es.close(); };
-    
+        const entry = JSON.parse(e.data);
+        if (entry.msg === '__DONE__' || entry.msg === '__ERROR__') { es.close(); return; }
+        setLogs(prev => [...prev, entry]);
+      };
+      es.onerror = () => es.close();
     } catch(e) { setError(e.message); }
   }
 
@@ -430,7 +406,7 @@ export default function App() {
   async function cancelJob() {
     if (!jobId) return;
     try { await fetch(`${API}/api/job/${jobId}/cancel`, { method:'POST' }); } catch {}
-    setView('home'); setJobId(null); setLogs([]); setStartedAt(null); setElapsed(0);
+    setView('home'); setJobId(null); setLogs([]); setStartedAt(null); setElapsed(0); setError(null);
   }
 
   async function approve() {
@@ -439,7 +415,7 @@ export default function App() {
   }
 
   async function deploy() {
-    if (!vercelToken && !process.env.VITE_HAS_VERCEL_TOKEN) {
+    if (!vercelToken && !import.meta.env.VITE_HAS_VERCEL_TOKEN) {
       const t = prompt('Enter your Vercel token (from vercel.com/account/tokens):');
       if (!t) return;
       setVercelToken(t);
@@ -492,7 +468,7 @@ export default function App() {
         </div>
         <div style={{display:'flex',gap:8,alignItems:'center'}}>
           {view==='review' && result?.meta?.issues?.length>0 && <span style={{fontFamily:'var(--fm)',fontSize:10,color:'#FCA5A5',background:'rgba(239,68,68,0.08)',border:'1px solid rgba(239,68,68,0.2)',padding:'4px 10px',borderRadius:5}}>⚠ {result.meta.issues.length} issues</span>}
-          {view!=='home' && <button onClick={()=>{setView('home');setLogs([]);setJobId(null);setResult(null);setDeployUrl(null);}} style={{background:'transparent',border:'1px solid var(--border)',color:'var(--muted)',padding:'5px 14px',borderRadius:6,cursor:'pointer',fontFamily:'var(--fm)',fontSize:11}}>← New</button>}
+          {view!=='home' && <button onClick={()=>{ if(view==='running'){cancelJob();}else{setView('home');setLogs([]);setJobId(null);setResult(null);setDeployUrl(null);setError(null);} }} style={{background:'transparent',border:'1px solid var(--border)',color:'var(--muted)',padding:'5px 14px',borderRadius:6,cursor:'pointer',fontFamily:'var(--fm)',fontSize:11}}>← New</button>}
         </div>
       </nav>
 
@@ -634,36 +610,27 @@ export default function App() {
 
         {/* ── RUNNING ──────────────────────────────────────────────────────── */}
         {view==='running' && (
-  <div style={{maxWidth:760,margin:'0 auto',padding:'50px 32px'}}>
-    <div style={{display:'flex',alignItems:'center',gap:14,marginBottom:24,flexWrap:'wrap'}}>
-      <div style={{width:18,height:18,border:'2px solid var(--blue)',borderTopColor:'transparent',borderRadius:'50%',animation:'spin 0.8s linear infinite',flexShrink:0}}/>
-      <h2 style={{fontFamily:'var(--fd)',fontSize:28,flex:1,minWidth:0}}>{mode==='build'?'Building':'Refreshing'}: {form.domain}</h2>
-      <div style={{display:'flex',alignItems:'center',gap:10,flexShrink:0}}>
-        <div style={{fontFamily:'var(--fm)',fontSize:12,color:'var(--muted)',background:'var(--surface)',border:'1px solid var(--border)',borderRadius:7,padding:'5px 14px',whiteSpace:'nowrap'}}>
-          ⏱ {Math.floor(elapsed/60)}m {String(elapsed%60).padStart(2,'0')}s
-        </div>
-        <button onClick={cancelJob} style={{padding:'5px 16px',background:'rgba(239,68,68,0.12)',border:'1px solid rgba(239,68,68,0.4)',borderRadius:7,color:'#FCA5A5',cursor:'pointer',fontFamily:'var(--fm)',fontSize:11,fontWeight:700,whiteSpace:'nowrap'}}>
-          ✕ Cancel Run
-        </button>
-      </div>
-    </div>
-    {error && (
-  <div style={{marginBottom:12,padding:'11px 15px',background:'rgba(239,68,68,0.08)',border:'1px solid rgba(239,68,68,0.25)',borderRadius:8,color:'#FCA5A5',fontSize:13,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-    <span>✗ {error}</span>
-    <button onClick={()=>{setView('home');setError(null);}} style={{background:'transparent',border:'1px solid rgba(239,68,68,0.3)',color:'#FCA5A5',borderRadius:5,padding:'3px 10px',cursor:'pointer',fontFamily:'var(--fm)',fontSize:11}}>← New Run</button>
-  </div>
-    )}
-    <div ref={logsRef} style={{background:'var(--surface)',border:'1px solid var(--border)',borderRadius:10,padding:'18px 22px',height:440,overflowY:'auto',fontFamily:'var(--fm)',fontSize:11.5,lineHeight:1.9}}>
-      {logs.length===0 && <span style={{color:'var(--muted)',animation:'pulse 1.5s ease infinite'}}>Connecting to pipeline...</span>}
-      {logs.map((e,i)=>(
-        <div key={i} style={{color:LC(e.level),paddingLeft:e.level==='stage'?0:14,display:'flex',gap:10}}>
-          <span style={{color:'rgba(255,255,255,0.18)',flexShrink:0,userSelect:'none'}}>{e.t?new Date(e.t).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'}):''}</span>
-          <span>{e.msg}</span>
-        </div>
-      ))}
-    </div>
-    <p style={{marginTop:14,fontSize:11,color:'var(--muted)',textAlign:'center'}}>Running in the cloud — this tab can stay open or you can close and come back</p>
-  </div>
+          <div style={{maxWidth:760,margin:'0 auto',padding:'50px 32px'}}>
+            <div style={{display:'flex',alignItems:'center',gap:14,marginBottom:24}}>
+              <div style={{width:18,height:18,border:'2px solid var(--blue)',borderTopColor:'transparent',borderRadius:'50%',animation:'spin 0.8s linear infinite',flexShrink:0}}/>
+              <h2 style={{fontFamily:'var(--fd)',fontSize:28}}>{mode==='build'?'Building':'Refreshing'}: {form.domain}</h2>
+              <div style={{marginLeft:'auto',fontFamily:'var(--fm)',fontSize:12,color:'var(--muted)',background:'var(--surface)',border:'1px solid var(--border)',borderRadius:7,padding:'5px 14px',whiteSpace:'nowrap'}}>
+                ⏱ {Math.floor(elapsed/60)}m {String(elapsed%60).padStart(2,'0')}s
+              </div>
+              <button onClick={cancelJob} style={{marginLeft:8,padding:'5px 14px',background:'rgba(239,68,68,0.1)',border:'1px solid rgba(239,68,68,0.3)',borderRadius:7,color:'#FCA5A5',cursor:'pointer',fontFamily:'var(--fm)',fontSize:11,fontWeight:600}}>
+                ✕ Cancel Run
+              </button>
+              <div style={{display:'none'}}>
+              </div>
+            </div>
+            <div ref={logsRef} style={{background:'var(--surface)',border:'1px solid var(--border)',borderRadius:10,padding:'18px 22px',height:440,overflowY:'auto',fontFamily:'var(--fm)',fontSize:11.5,lineHeight:1.9}}>
+              {logs.length===0 && <span style={{color:'var(--muted)',animation:'pulse 1.5s ease infinite'}}>Connecting to pipeline...</span>}
+              {logs.map((e,i)=>(
+                <div key={i} style={{color:LC(e.level),paddingLeft:e.level==='stage'?0:14,display:'flex',gap:10}}><span style={{color:'rgba(255,255,255,0.18)',flexShrink:0,userSelect:'none'}}>{e.t?new Date(e.t).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'}):''}</span><span>{e.msg}</span></div>
+              ))}
+            </div>
+            <p style={{marginTop:14,fontSize:11,color:'var(--muted)',textAlign:'center'}}>Running in the cloud — this tab can stay open or you can close and come back</p>
+          </div>
         )}
 
         {/* ── REVIEW ───────────────────────────────────────────────────────── */}
