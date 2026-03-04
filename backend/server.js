@@ -391,68 +391,70 @@ async function buildPipeline(jobId, domain, brief, persona, apiKey) {
   vendors.forEach((v,i) => { v.id=i+1; });
   L(`✓ ${vendors.length} total vendors`, 'success');
 
-  // ── Stage 1c: Verification (1 category per batch to avoid web search rate limits) ──
+ // ── Stage 1c: Verification (knowledge-based, no web search) ───────────────
+checkCancelled();
+L(''); L('── Stage 1c: Verification Agent (knowledge gap-check) ──', 'stage');
+L('  Checking for missing vendors from training knowledge...');
+
+const verifySchema = `{"new_vendors":[{"name":"str","type":"AI-Native|Legacy","status":"Private|Public","hq":"City, Country","founded":2020,"funding":30,"valuation":null,"round_type":"Series A|null","round_amount":30,"round_date":"Jan 2025|null","acq_price":null,"acquirer":null,"employees":80,"arr":null,"investors":"VC Names","agentic":true,"cat":1,"desc":"2 sentences.","products":"Product A, B","capabilities":"Cap 1; Cap 2"}]}`;
+
+const verifiedNewVendors = [];
+const existingNames = new Set(vendors.map(v => v.name.toLowerCase()));
+
+// 3 categories per batch — no web search so no TPM spike risk
+const catBatchesV = [];
+for (let i = 0; i < categories.length; i+=3) catBatchesV.push(categories.slice(i, i+3));
+
+for (let bi = 0; bi < catBatchesV.length; bi++) {
   checkCancelled();
-  L(''); L('── Stage 1c: Verification Agent (web search gap-check) ──', 'stage');
-  L('  Checking for missing vendors — especially recent AI-native startups...');
-  await sleep(15000); // TPM buffer before web search — load-bearing
+  const batch = catBatchesV[bi];
+  L(`  Verifying batch ${bi+1}/${catBatchesV.length}: [${batch.map(c=>c.phase).join(', ')}]`);
+  const existingInBatch = vendors.filter(v => batch.some(c => c.id===v.cat)).map(v => v.name);
 
-  const verifySchema = `{"new_vendors":[{"name":"str","type":"AI-Native|Legacy","status":"Private|Public","hq":"City, Country","founded":2020,"funding":30,"valuation":null,"round_type":"Series A|null","round_amount":30,"round_date":"Jan 2025|null","acq_price":null,"acquirer":null,"employees":80,"arr":null,"investors":"VC Names","agentic":true,"cat":1,"desc":"2 sentences.","products":"Product A, B","capabilities":"Cap 1; Cap 2"}]}`;
+  try {
+    const rv = await withRetry(async () => withTimeout(
+      client.messages.create({
+        model: MODEL, max_tokens: 4000,
+        system: `You are a technology analyst reviewing a vendor landscape for gaps. From your training knowledge, identify notable vendors MISSED in the initial pass — especially AI-native startups founded post-2020, niche specialists, and recently acquired companies. Output ONLY valid JSON.`,
+        messages: [{ role:'user', content:`Domain: ${domain}
+Categories: ${batch.map(c=>`[${c.phase}] ${c.name}`).join(' | ')}
 
-  const verifiedNewVendors = [];
-  const existingNames = new Set(vendors.map(v => v.name.toLowerCase()));
+Already in landscape (DO NOT repeat): ${existingInBatch.join(', ')}
 
-  for (let bi=0; bi<categories.length; bi++) {
-    checkCancelled();
-    const cat = categories[bi];
-    L(`  Verifying ${bi+1}/${categories.length}: [${cat.phase}]`);
-    const existingInCat = vendors.filter(v => v.cat===cat.id).map(v => v.name);
+From your training knowledge, identify 2-5 notable vendors missing from these categories. Focus on:
+1. AI-native startups with significant funding or traction
+2. Established vendors frequently cited in analyst reports
+3. Recently acquired companies that were notable independents
 
-    try {
-      const rv = await withRetry(async () => withTimeout(
-        wsClient.messages.create({
-          model:MODEL, max_tokens:4000,
-          system:`You are a technology analyst finding gaps in a vendor landscape. Find notable vendors MISSED in the initial pass — especially recently funded AI-native startups (last 18 months), niche specialists, recently acquired companies. Only return vendors you can verify exist via web search. Output ONLY valid JSON.`,
-          tools:[{type:'web_search_20250305',name:'web_search'}],
-          messages:[{role:'user',content:`Domain: ${domain}
-Category: [${cat.phase}] ${cat.name}
+Assign each to the most relevant cat ID (${batch.map(c=>`${c.id}=${c.phase}`).join(', ')}).
 
-Already in landscape for this category (DO NOT repeat): ${existingInCat.join(', ')}
+${verifySchema}` }]
+      }),
+      90000, `verify-${bi+1}`
+    ), `verify-${bi+1}`);
 
-Search for:
-1. AI-native startups in this category that raised funding in last 18 months
-2. Market leaders or frequently cited vendors missing from the list
-3. Recently acquired companies notable in this space
-
-Return 2-5 genuinely new vendors NOT already listed. Use cat ID: ${cat.id}
-
-${verifySchema}`}]
-        }),
-        120000, `verify-${bi+1}`
-      ), `verify-${bi+1}`);
-
-      const dv = parseJSON(extractText(rv));
-      const newOnes = (dv.new_vendors||[]).filter(v => !existingNames.has(v.name.toLowerCase()));
-      newOnes.forEach(v => existingNames.add(v.name.toLowerCase()));
-      verifiedNewVendors.push(...newOnes);
-      L(`  ✓ ${bi+1}/${categories.length}: +${newOnes.length} new vendors`, 'success');
-    } catch(e) {
-      if (e.message==='__CANCELLED__') throw e;
-      L(`  ✗ Verify ${bi+1} failed: ${e.message}`, 'error');
-    }
-    // 30s between web search calls — load-bearing, do not reduce
-    if (bi < categories.length-1) await sleep(30000);
+    const dv = parseJSON(extractText(rv));
+    const newOnes = (dv.new_vendors||[]).filter(v => !existingNames.has(v.name.toLowerCase()));
+    newOnes.forEach(v => existingNames.add(v.name.toLowerCase()));
+    verifiedNewVendors.push(...newOnes);
+    L(`  ✓ Batch ${bi+1}: +${newOnes.length} new vendors`, 'success');
+  } catch(e) {
+    if (e.message === '__CANCELLED__') throw e;
+    L(`  ✗ Verify batch ${bi+1} failed: ${e.message}`, 'error');
   }
+  // 5s gap — same as vendor discovery, no web search so no TPM spike
+  if (bi < catBatchesV.length - 1) await sleep(5000);
+}
 
-  if (verifiedNewVendors.length > 0) {
-    const startId = vendors.length+1;
-    verifiedNewVendors.forEach((v,i) => { v.id=startId+i; });
-    vendors.push(...verifiedNewVendors);
-    L(`✓ Verification complete — +${verifiedNewVendors.length} added (${vendors.length} total)`, 'success');
-  } else {
-    L('✓ Verification complete — no gaps found', 'success');
-  }
-
+if (verifiedNewVendors.length > 0) {
+  const startId = vendors.length + 1;
+  verifiedNewVendors.forEach((v,i) => { v.id = startId + i; });
+  vendors.push(...verifiedNewVendors);
+  L(`✓ Verification complete — +${verifiedNewVendors.length} added (${vendors.length} total)`, 'success');
+} else {
+  L('✓ Verification complete — no gaps found', 'success');
+}
+  
   // ── Stage 1d: Scoring (3 categories per batch) ────────────────────────────
   checkCancelled();
   L(''); L('── Stage 1d: Scoring Agent ───────────────────', 'stage');
