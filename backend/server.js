@@ -4,11 +4,14 @@
  * Deploy to Railway — no timeout limits
  *
  * Changes in this version:
- *  + Heartbeat: logs "still running [stage]" every 60s so silent hangs are visible
- *  + currentStage tracker: every API call updates stage label before firing
- *  + Vendor calls use maxRetries=2 (not 4) — a hung vendor call retries twice then
- *    moves on rather than burning 7+ minutes silently cycling through 4 retries
- *  + All prior fixes retained (model, wsClient, withTimeout, makeRetry, etc.)
+ *  + Stage 1d: Dedicated Capability Agent — defines 5 capabilities per category
+ *    BEFORE scoring, grounded in category context and vendor list. Eliminates
+ *    generic/wrong capabilities that occurred when capability definition was
+ *    bundled with scoring.
+ *  + Stage 1e: Scoring Agent now scores against pre-defined capabilities only —
+ *    no more capability invention, tighter prompts, fewer timeouts.
+ *  + Old Stage 1d (scoring) → Stage 1e. Old Stage 1e (quality pass) → Stage 1f.
+ *  + All prior fixes retained (withTimeout, makeRetry, heartbeat, cancel, etc.)
  */
 import express from 'express';
 import cors from 'cors';
@@ -263,8 +266,7 @@ function withTimeout(promise, ms, label) {
 
 // ── RETRY FACTORY ─────────────────────────────────────────────────────────────
 // Module-level so both pipelines use it.
-// maxRetries default is 4 for rate limits, but vendor/scoring calls pass 2
-// to avoid spending 7+ minutes silently cycling through retries on a hung call.
+// maxRetries default 4 for rate limits; vendor/scoring calls pass 2 to fail fast.
 // Backoff: 30s, 60s, 120s, 240s for 429s. Flat 20s for timeouts.
 function makeRetry(logFn, cancelFn) {
   return async function withRetry(fn, label, maxRetries=4) {
@@ -324,8 +326,6 @@ async function buildPipeline(jobId, domain, brief, persona, apiKey) {
   const withRetry = makeRetry(L, checkCancelled);
 
   // ── Heartbeat ──────────────────────────────────────────────────────────────
-  // Logs every 60s so you can see the pipeline is alive even during slow API calls.
-  // currentStage is updated before each call so you know exactly where it's stuck.
   let currentStage = 'starting';
   const heartbeat = setInterval(() => {
     const job = jobs.get(jobId);
@@ -333,7 +333,6 @@ async function buildPipeline(jobId, domain, brief, persona, apiKey) {
     L(`  ⏳ Still running [${currentStage}] — waiting for API response...`, 'info');
   }, 60000);
 
-  // Wrap finalize/fail so heartbeat is always cleared
   const done = (result) => { clearInterval(heartbeat); finalize(jobId, result); };
   const bail = (msg)    => { clearInterval(heartbeat); fail(jobId, msg); };
 
@@ -369,7 +368,6 @@ async function buildPipeline(jobId, domain, brief, persona, apiKey) {
     async function fetchVendorsForCat(cat) {
       L(`  [${cat.phase}] Discovering vendors...`);
       currentStage = `1b-vendors-${cat.phase}`;
-      // maxRetries=2 for vendor calls — fail fast rather than cycle through 4 retries silently
       return withRetry(async () => {
         const r = await withTimeout(
           client.messages.create({
@@ -383,7 +381,7 @@ async function buildPipeline(jobId, domain, brief, persona, apiKey) {
         const vends = (d.vendors||[]).map(v => ({...v, cat:cat.id}));
         L(`  [${cat.phase}] ✓ ${vends.length} vendors`);
         return vends;
-      }, cat.phase, 2); // maxRetries=2
+      }, cat.phase, 2);
     }
 
     const vendors = [];
@@ -395,12 +393,12 @@ async function buildPipeline(jobId, domain, brief, persona, apiKey) {
         if (e.message==='__CANCELLED__') throw e;
         L(`  [${categories[i].phase}] ✗ Failed: ${e.message}`, 'error');
       }
-      if (i < categories.length-1) await sleep(5000); // load-bearing TPM gap
+      if (i < categories.length-1) await sleep(5000);
     }
     vendors.forEach((v,i) => { v.id=i+1; });
     L(`✓ ${vendors.length} total vendors`, 'success');
 
-    // ── Stage 1c: Verification (knowledge-based, no web search) ─────────────
+    // ── Stage 1c: Verification (knowledge-based gap-check) ──────────────────
     checkCancelled();
     L(''); L('── Stage 1c: Verification Agent (knowledge gap-check) ──', 'stage');
     L('  Checking for missing vendors from training knowledge...');
@@ -438,7 +436,7 @@ Assign each to the most relevant cat ID (${batch.map(c=>`${c.id}=${c.phase}`).jo
 ${verifySchema}`}]
           }),
           90000, `verify-${bi+1}`
-        ), `verify-${bi+1}`, 2); // maxRetries=2
+        ), `verify-${bi+1}`, 2);
 
         const dv = parseJSON(extractText(rv));
         const newOnes = (dv.new_vendors||[]).filter(v => !existingNames.has(v.name.toLowerCase()));
@@ -461,103 +459,238 @@ ${verifySchema}`}]
       L('✓ Verification complete — no gaps found', 'success');
     }
 
-    // ── Stage 1d: Scoring (2 categories per batch) ───────────────────────────
+    // ── Stage 1d: Capability Agent (dedicated, 3 cats per batch) ────────────
+    // Defines capabilities BEFORE scoring so the Scoring Agent never has to
+    // invent them. This is the key fix for generic/wrong capabilities.
     checkCancelled();
-    L(''); L('── Stage 1d: Scoring Agent ───────────────────', 'stage');
+    L(''); L('── Stage 1d: Capability Agent ────────────────', 'stage');
+    L('  Defining capability dimensions per category...');
 
-    const allVendorNames = [...new Set(vendors.map(v => v.name))];
-    const capabilities = [];
+    const definedCapabilities = []; // populated here, scores added in Stage 1e
+    const capBatches = [];
+    for (let i=0; i<categories.length; i+=3) capBatches.push(categories.slice(i,i+3));
+
+    for (let bi=0; bi<capBatches.length; bi++) {
+      checkCancelled();
+      const batch = capBatches[bi];
+      currentStage = `1d-capabilities-batch${bi+1}`;
+      L(`  Defining batch ${bi+1}/${capBatches.length}: [${batch.map(c=>c.phase).join(', ')}]`);
+
+      try {
+        const r = await withRetry(async () => withTimeout(
+          client.messages.create({
+            model:MODEL, max_tokens:4000,
+            system:`You are a senior technology analyst defining capability dimensions for vendor evaluation matrices. 
+
+Rules:
+- Each capability must be SPECIFIC to this category — not generic across all enterprise tech
+- Capabilities should clearly differentiate vendors (some score 85+, others score below 50)
+- Name the capability precisely: "Agentless Network Scanning" not "Scanning", "ML-Based Anomaly Detection" not "AI"
+- Cover the full spectrum: core function, advanced features, enterprise readiness, depth of integration, and AI/automation
+- A buyer reading the capability name should immediately know what is being evaluated
+
+Output ONLY valid JSON, no preamble.`,
+            messages:[{role:'user',content:`Domain: ${domain}
+Buyer persona: ${persona}
+
+Categories to define capabilities for:
+${batch.map(c => `
+Cat ${c.id} [${c.phase}] ${c.name}
+  What it does: ${c.desc}
+  Vendors in this category: ${vendors.filter(v=>v.cat===c.id).slice(0,6).map(v=>`${v.name} [${v.type}]`).join(', ')}
+  Initial capability hints: ${(c.capabilities_preview||[]).join(', ')}`).join('\n')}
+
+For EACH category above, define EXACTLY 5 capabilities that ${persona}s use to evaluate vendors in this space.
+
+Output: {"capabilities": [{"cat": 1, "name": "Precise Capability Name", "definition": "One sentence: what this measures and what distinguishes a top score (85+) from a low score (under 50)."}]}`}]
+          }),
+          90000, `capabilities-batch${bi+1}`
+        ), `capabilities-batch${bi+1}`, 2);
+
+        const d = parseJSON(extractText(r));
+        const newCaps = (d.capabilities||[]).map(cap => ({ ...cap, scores: {} }));
+        definedCapabilities.push(...newCaps);
+        batch.forEach(cat => {
+          const count = newCaps.filter(c => c.cat===cat.id).length;
+          L(`  [${cat.phase}] ✓ ${count} capabilities defined`);
+        });
+      } catch(e) {
+        if (e.message==='__CANCELLED__') throw e;
+        L(`  ✗ Capability batch ${bi+1} failed: ${e.message}`, 'error');
+      }
+      if (bi < capBatches.length-1) await sleep(5000);
+    }
+
+    // Stage 1d top-up: categories that got 0 capabilities defined
+    const definedCatIds = new Set(definedCapabilities.map(c => c.cat));
+    const missingCapCats = categories.filter(c => !definedCatIds.has(c.id));
+    if (missingCapCats.length > 0) {
+      L(`  ⚠ ${missingCapCats.length} categories missing capability definitions — topping up...`, 'error');
+      for (const cat of missingCapCats) {
+        checkCancelled();
+        currentStage = `1d-captopup-${cat.phase}`;
+        L(`  Cap definition top-up: [${cat.phase}]...`);
+        try {
+          const r = await withRetry(async () => withTimeout(
+            client.messages.create({
+              model:MODEL, max_tokens:2000,
+              system:`You are a technology analyst defining evaluation capabilities for a vendor matrix. Output ONLY valid JSON.`,
+              messages:[{role:'user',content:`Domain: ${domain}
+Category: Cat ${cat.id} [${cat.phase}] ${cat.name}
+Description: ${cat.desc}
+Vendors: ${vendors.filter(v=>v.cat===cat.id).map(v=>`${v.name} [${v.type}]`).join(', ')}
+
+Define EXACTLY 5 specific, differentiated capabilities for evaluating vendors in this category.
+Output: {"capabilities": [{"cat": ${cat.id}, "name": "Precise Name", "definition": "One sentence with scoring guidance."}]}`}]
+            }),
+            60000, `captopup-${cat.phase}`
+          ), `captopup-${cat.phase}`, 2);
+          const d = parseJSON(extractText(r));
+          const newCaps = (d.capabilities||[]).map(cap => ({ ...cap, scores: {} }));
+          definedCapabilities.push(...newCaps);
+          L(`  ✓ Cap definition top-up [${cat.phase}]: +${newCaps.length}`, 'success');
+        } catch(e) {
+          if (e.message==='__CANCELLED__') throw e;
+          L(`  ✗ Cap top-up [${cat.phase}] failed: ${e.message}`, 'error');
+        }
+        if (missingCapCats.indexOf(cat) < missingCapCats.length-1) await sleep(5000);
+      }
+    }
+
+    L(`✓ ${definedCapabilities.length} capabilities defined across ${categories.length} categories`, 'success');
+
+    // ── Stage 1e: Scoring Agent (scores pre-defined capabilities only) ───────
+    // Now only scores — no capability invention. Tighter prompts, faster calls.
+    checkCancelled();
+    L(''); L('── Stage 1e: Scoring Agent ───────────────────', 'stage');
+
     const scoreBatches = [];
     for (let i=0; i<categories.length; i+=2) scoreBatches.push(categories.slice(i,i+2));
 
     for (const batch of scoreBatches) {
       checkCancelled();
       const bIds = batch.map(c => c.id);
-      currentStage = `1d-scoring-[${bIds.join(',')}]`;
+      currentStage = `1e-scoring-[${bIds.join(',')}]`;
       L(`  Scoring [${bIds.join(',')}]...`);
+
       const bVendors = vendors.filter(v => bIds.includes(v.cat));
+      const bCaps    = definedCapabilities.filter(c => bIds.includes(c.cat));
+
+      if (bCaps.length === 0) {
+        L(`  ⚠ No capabilities defined for [${bIds.join(',')}], skipping`, 'error');
+        continue;
+      }
+
       try {
         const r = await withRetry(async () => withTimeout(
           client.messages.create({
-            model:MODEL, max_tokens:12000,
-            system:`You are a technology analyst scoring vendor capabilities 0-100. Scale: 90-100=Best-in-Class (only 1 per capability), 75-89=Strong, 60-74=Capable, 45-59=Present, 30-44=Limited, 0=Not applicable. Differentiate clearly — avoid clustering. AI-Native vendors score higher on AI/automation; Legacy higher on enterprise integrations and compliance. Output ONLY valid JSON.`,
+            model:MODEL, max_tokens:10000,
+            system:`You are a technology analyst scoring vendors 0-100 on defined capability dimensions.
+
+Scoring scale:
+- 90-100: Best-in-Class (award to MAX 1-2 vendors per capability)
+- 75-89:  Strong
+- 60-74:  Capable
+- 45-59:  Present / basic support
+- 30-44:  Limited / early-stage
+- 0:      Not applicable / outside vendor focus
+
+Rules:
+- Differentiate clearly — spread scores across the full range, avoid clustering at 70-80
+- AI-Native vendors score higher on AI/automation capabilities
+- Legacy vendors score higher on enterprise compliance and deep integrations
+- Score 0 when the capability is genuinely outside the vendor's scope
+
+Output ONLY valid JSON, no preamble.`,
             messages:[{role:'user',content:`Domain: ${domain}
 
-Categories to score:
-${batch.map(c=>`Cat ${c.id} [${c.phase}] ${c.name}\n  Preview caps: ${(c.capabilities_preview||[]).join(', ')}`).join('\n\n')}
+Pre-defined capabilities to score (use EXACT names):
+${bCaps.map(c=>`[Cat ${c.cat}] "${c.name}": ${c.definition}`).join('\n')}
 
-Vendors in these categories:
-${bVendors.map(v=>`  [${v.type}] ${v.name} (Cat ${v.cat}): ${(v.desc||'').slice(0,90)}`).join('\n')}
+Vendors to score:
+${bVendors.map(v=>`  [Cat ${v.cat}] [${v.type}] ${v.name}: ${(v.desc||'').slice(0,100)}`).join('\n')}
 
-Vendor names to score: ${bVendors.map(v=>v.name).join(', ')}
+Score ONLY these vendors: ${bVendors.map(v=>v.name).join(', ')}
+Score ONLY these capabilities (exact names): ${bCaps.map(c=>c.name).join(', ')}
 
-Define EXACTLY 5 capabilities per category. Score ONLY the vendors listed above (use 0 if not applicable).
-
-Output: {"capabilities":[{"cat":1,"name":"Specific Capability Name","definition":"One sentence what this does and why it matters.","scores":{"VendorName":85,"Other":0}}]}`}]
+Output: {"scores": [{"cap": "Exact Capability Name", "cat": 1, "vendor": "VendorName", "score": 85}]}`}]
           }),
           120000, `scoring-${bIds.join(',')}`
-        ), `scoring-${bIds.join(',')}`, 2); // maxRetries=2
+        ), `scoring-${bIds.join(',')}`, 2);
 
         const d = parseJSON(extractText(r));
-        const newCaps = d.capabilities||[];
-        capabilities.push(...newCaps);
-        L(`  ✓ [${bIds.join(',')}]: ${newCaps.length} capabilities`);
+        // Merge scores into the definedCapabilities objects
+        (d.scores||[]).forEach(s => {
+          const cap = definedCapabilities.find(c => c.cat===s.cat && c.name===s.cap);
+          if (cap) cap.scores[s.vendor] = s.score;
+        });
+        L(`  ✓ [${bIds.join(',')}]: ${bVendors.length} vendors × ${bCaps.length} capabilities`);
       } catch(e) {
         if (e.message==='__CANCELLED__') throw e;
         L(`  ✗ Scoring [${bIds.join(',')}] failed: ${e.message}`, 'error');
       }
+      await sleep(5000);
     }
-    L(`  Scored ${capabilities.length} capabilities across ${categories.length} categories`);
 
-    // ── Stage 1d Top-up: categories that got 0 capabilities ─────────────────
-    const scoredCatIds = new Set(capabilities.map(c => c.cat));
-    const missingCats = categories.filter(c => !scoredCatIds.has(c.id));
+    // Stage 1e top-up: re-score any categories that got 0 scores filled in
+    const scoredCatIds = new Set(
+      definedCapabilities
+        .filter(c => Object.keys(c.scores||{}).length > 0)
+        .map(c => c.cat)
+    );
+    const unscoredCats = categories.filter(c => !scoredCatIds.has(c.id));
 
-    if (missingCats.length > 0) {
-      L(`  ⚠ ${missingCats.length} categories missing capabilities — running top-up...`, 'error');
-      for (const cat of missingCats) {
+    if (unscoredCats.length > 0) {
+      L(`  ⚠ ${unscoredCats.length} categories unscored — running top-up...`, 'error');
+      for (const cat of unscoredCats) {
         checkCancelled();
-        currentStage = `1d-topup-${cat.phase}`;
-        L(`  Top-up scoring: [${cat.phase}]...`);
+        currentStage = `1e-scoretopup-${cat.phase}`;
+        L(`  Score top-up: [${cat.phase}]...`);
         const catVendors = vendors.filter(v => v.cat===cat.id);
+        const catCaps    = definedCapabilities.filter(c => c.cat===cat.id);
         try {
           const r = await withRetry(async () => withTimeout(
             client.messages.create({
-              model:MODEL, max_tokens:8000,
-              system:`You are a technology analyst scoring vendor capabilities 0-100. Output ONLY valid JSON.`,
+              model:MODEL, max_tokens:6000,
+              system:`You are a technology analyst scoring vendors 0-100 on defined capabilities. Output ONLY valid JSON.`,
               messages:[{role:'user',content:`Domain: ${domain}
 Category: Cat ${cat.id} [${cat.phase}] ${cat.name}
-Preview capabilities: ${(cat.capabilities_preview||[]).join(', ')}
+
+Capabilities (pre-defined):
+${catCaps.map(c=>`"${c.name}": ${c.definition}`).join('\n')}
 
 Vendors: ${catVendors.map(v=>`${v.name} [${v.type}]`).join(', ')}
 
-Vendor names to score: ${catVendors.map(v=>v.name).join(', ')}
-
-Define EXACTLY 5 capabilities for this category. Score ONLY the vendors listed above (0 if not applicable).
-Output: {"capabilities":[{"cat":${cat.id},"name":"Capability Name","definition":"One sentence.","scores":{"VendorName":75}}]}`}]
-        
+Score ONLY these vendors on ONLY these capabilities.
+Output: {"scores": [{"cap": "Exact Capability Name", "cat": ${cat.id}, "vendor": "VendorName", "score": 75}]}`}]
             }),
-            90000, `topup-${cat.phase}`
-          ), `topup-${cat.phase}`, 2);
+            90000, `scoretopup-${cat.phase}`
+          ), `scoretopup-${cat.phase}`, 2);
 
           const d = parseJSON(extractText(r));
-          capabilities.push(...(d.capabilities||[]));
-          L(`  ✓ Top-up [${cat.phase}]: +${(d.capabilities||[]).length} capabilities`, 'success');
+          (d.scores||[]).forEach(s => {
+            const cap = definedCapabilities.find(c => c.cat===s.cat && c.name===s.cap);
+            if (cap) cap.scores[s.vendor] = s.score;
+          });
+          L(`  ✓ Score top-up [${cat.phase}]: done`, 'success');
         } catch(e) {
           if (e.message==='__CANCELLED__') throw e;
-          L(`  ✗ Top-up [${cat.phase}] failed: ${e.message}`, 'error');
+          L(`  ✗ Score top-up [${cat.phase}] failed: ${e.message}`, 'error');
         }
-        if (missingCats.indexOf(cat) < missingCats.length-1) await sleep(5000);
+        if (unscoredCats.indexOf(cat) < unscoredCats.length-1) await sleep(5000);
       }
     }
-    L(`✓ ${capabilities.length} total capabilities scored`, 'success');
 
-    // ── Stage 1e: Final Quality Pass ─────────────────────────────────────────
+    // definedCapabilities now has scores merged in — this is the final capabilities array
+    const capabilities = definedCapabilities;
+    L(`✓ ${capabilities.length} capabilities scored`, 'success');
+
+    // ── Stage 1f: Final Quality Pass ─────────────────────────────────────────
     checkCancelled();
-    L(''); L('── Stage 1e: Final Quality Pass ──────────────────', 'stage');
-    currentStage = '1e-quality-pass';
+    L(''); L('── Stage 1f: Final Quality Pass ──────────────────', 'stage');
+    currentStage = '1f-quality-pass';
 
-    // 1e-i: Vendor top-up — categories with fewer than 7 vendors
+    // 1f-i: Vendor top-up — categories with fewer than 7 vendors
     const vendorCountByCat = {};
     categories.forEach(c => { vendorCountByCat[c.id] = vendors.filter(v => v.cat===c.id).length; });
     const sparseCategories = categories.filter(c => vendorCountByCat[c.id] < 7);
@@ -595,6 +728,34 @@ ${vSchemaTopup}`}]
           const startId = vendors.length+1;
           newVends.forEach((v,i) => { v.id=startId+i; });
           vendors.push(...newVends);
+
+          // Score new vendors against existing capabilities for this category
+          if (newVends.length > 0) {
+            const catCaps = capabilities.filter(c => c.cat===cat.id);
+            if (catCaps.length > 0) {
+              try {
+                const rs = await withRetry(async () => withTimeout(
+                  client.messages.create({
+                    model:MODEL, max_tokens:3000,
+                    system:`Score vendors 0-100 on defined capabilities. Output ONLY valid JSON.`,
+                    messages:[{role:'user',content:`New vendors: ${newVends.map(v=>`${v.name} [${v.type}]`).join(', ')}
+Capabilities: ${catCaps.map(c=>`"${c.name}": ${c.definition}`).join('\n')}
+Output: {"scores":[{"cap":"Name","cat":${cat.id},"vendor":"Name","score":75}]}`}]
+                  }),
+                  60000, `topup-score-${cat.phase}`
+                ), `topup-score-${cat.phase}`, 2);
+                const ds = parseJSON(extractText(rs));
+                (ds.scores||[]).forEach(s => {
+                  const cap = capabilities.find(c => c.cat===s.cat && c.name===s.cap);
+                  if (cap) cap.scores[s.vendor] = s.score;
+                });
+              } catch(e) {
+                if (e.message==='__CANCELLED__') throw e;
+                L(`  ⚠ Could not score top-up vendors for [${cat.phase}]`, 'error');
+              }
+            }
+          }
+
           L(`  ✓ [${cat.phase}]: +${newVends.length} vendors (now ${have+newVends.length})`, 'success');
         } catch(e) {
           if (e.message==='__CANCELLED__') throw e;
@@ -606,64 +767,15 @@ ${vSchemaTopup}`}]
       L('  ✓ All categories have 7+ vendors', 'success');
     }
 
-    // 1e-ii: Capability top-up — missing or thin categories
-    const scoredCatIdsCheck = new Set(capabilities.map(c => c.cat));
-    const stillMissingCaps = categories.filter(c => !scoredCatIdsCheck.has(c.id));
-    const thinCaps = categories.filter(c => scoredCatIdsCheck.has(c.id) &&
-      capabilities.filter(cap => cap.cat===c.id).length < 3);
-    const capsToFix = [...new Set([...stillMissingCaps, ...thinCaps])];
-
-    if (capsToFix.length > 0) {
-      L(`  ⚠ ${capsToFix.length} categories need capability top-up...`, 'error');
-      const allVendorNamesCheck = [...new Set(vendors.map(v => v.name))];
-      for (const cat of capsToFix) {
-        checkCancelled();
-        const catVendors = vendors.filter(v => v.cat===cat.id);
-        const have = capabilities.filter(c => c.cat===cat.id).length;
-        L(`  Cap top-up [${cat.phase}]: have ${have}, targeting 5...`);
-        try {
-          const r = await withRetry(async () => withTimeout(
-            client.messages.create({
-              model:MODEL, max_tokens:8000,
-              system:`You are a technology analyst scoring vendor capabilities 0-100. Output ONLY valid JSON.`,
-              messages:[{role:'user',content:`Domain: ${domain}
-Category: Cat ${cat.id} [${cat.phase}] ${cat.name}
-Preview capabilities: ${(cat.capabilities_preview||[]).join(', ')}
-
-Vendors in this category: ${catVendors.map(v=>`${v.name} [${v.type}]`).join(', ')}
-
-Vendor names to score: ${catVendors.map(v=>v.name).join(', ')}
-
-Define EXACTLY 5 capabilities for this category. Score ONLY the vendors listed above (0 if not applicable).
-Output: {"capabilities":[{"cat":${cat.id},"name":"Capability Name","definition":"One sentence.","scores":{"VendorName":75}}]}`}]
-
-            }),
-            90000, `cap-topup-${cat.phase}`
-          ), `cap-topup-${cat.phase}`, 2);
-
-          const d = parseJSON(extractText(r));
-          const withoutThin = capabilities.filter(c => c.cat!==cat.id);
-          capabilities.length = 0;
-          capabilities.push(...withoutThin, ...(d.capabilities||[]));
-          L(`  ✓ Cap top-up [${cat.phase}]: now ${capabilities.filter(c=>c.cat===cat.id).length} caps`, 'success');
-        } catch(e) {
-          if (e.message==='__CANCELLED__') throw e;
-          L(`  ✗ Cap top-up [${cat.phase}] failed: ${e.message}`, 'error');
-        }
-        if (capsToFix.indexOf(cat) < capsToFix.length-1) await sleep(5000);
-      }
-    } else {
-      L('  ✓ All categories have sufficient capabilities', 'success');
-    }
-
-    // 1e-iii: Final counts summary
+    // 1f-ii: Final counts summary
     L('');
     L(`  Final counts: ${categories.length} categories | ${vendors.length} vendors | ${capabilities.length} capabilities`, 'success');
     categories.forEach(c => {
       const vc = vendors.filter(v=>v.cat===c.id).length;
       const cc = capabilities.filter(cap=>cap.cat===c.id).length;
+      const sc = capabilities.filter(cap=>cap.cat===c.id && Object.keys(cap.scores||{}).length>0).length;
       const flag = (vc < 7 || cc < 3) ? ' ⚠' : ' ✓';
-      L(`    ${flag} [${c.phase}] ${vc} vendors, ${cc} capabilities`);
+      L(`    ${flag} [${c.phase}] ${vc} vendors, ${cc} capabilities (${sc} scored)`);
     });
 
     // ── Validation ────────────────────────────────────────────────────────────
